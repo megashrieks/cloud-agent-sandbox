@@ -209,9 +209,9 @@ func (r *KubeRuntime) buildPod(spec SandboxSpec, pvcName string) *corev1.Pod {
 	container := corev1.Container{
 		Name:         "sandbox",
 		Image:        imageOrDefault(spec.Image, r.sc.DefaultImage),
-		Command:      []string{"/bin/sh", "-c", "sleep infinity"},
+		Command:      []string{"/bin/sh", "-c", sandboxInitScript},
 		VolumeMounts: mounts,
-		Env:          proxyEnv(spec.ProxyEndpoint),
+		Env:          append(proxyEnv(spec.ProxyEndpoint), caTrustEnv(len(spec.CACert) > 0, r.sc.CACertPath)...),
 		Resources: corev1.ResourceRequirements{
 			Limits: resourceList(r.sc.CPULimit, r.sc.MemoryLimit),
 		},
@@ -335,6 +335,43 @@ func proxyEnv(endpoint string) []corev1.EnvVar {
 		{Name: "NO_PROXY", Value: "localhost,127.0.0.1"},
 	}
 }
+
+// caBundlePath is where the sandbox init script assembles the trusted CA bundle
+// (OS roots + injected proxy CA). It lives under /tmp because the root FS is
+// read-only.
+const caBundlePath = "/tmp/ca-bundle.crt"
+
+// caTrustEnv returns the environment variables that point common toolchains at
+// the assembled CA bundle so git/curl/node/python transparently trust the MITM
+// proxy. Only emitted when a proxy CA is injected.
+func caTrustEnv(hasCA bool, _ string) []corev1.EnvVar {
+	if !hasCA {
+		return nil
+	}
+	return []corev1.EnvVar{
+		{Name: "NODE_EXTRA_CA_CERTS", Value: caBundlePath},
+		{Name: "REQUESTS_CA_BUNDLE", Value: caBundlePath},
+		{Name: "SSL_CERT_FILE", Value: caBundlePath},
+		{Name: "GIT_SSL_CAINFO", Value: caBundlePath},
+		{Name: "CURL_CA_BUNDLE", Value: caBundlePath},
+	}
+}
+
+// sandboxInitScript builds the CA trust bundle (if a proxy CA was mounted) and
+// then keeps the container alive so the orchestrator can exec into it. Running
+// this as the pod command (rather than relying on the image entrypoint) makes
+// CA trust work for ANY user-supplied image, not just the curated default.
+const sandboxInitScript = `
+if [ -f /etc/sandbox/ca.crt ]; then
+  if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    cat /etc/ssl/certs/ca-certificates.crt /etc/sandbox/ca.crt > /tmp/ca-bundle.crt 2>/dev/null || cp /etc/sandbox/ca.crt /tmp/ca-bundle.crt
+  else
+    cp /etc/sandbox/ca.crt /tmp/ca-bundle.crt
+  fi
+  git config --global http.sslCAInfo /tmp/ca-bundle.crt 2>/dev/null || true
+fi
+exec sleep infinity
+`
 
 func imageOrDefault(image, fallback string) string {
 	if image != "" {
