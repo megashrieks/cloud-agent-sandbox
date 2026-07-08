@@ -65,6 +65,12 @@ func (r *KubeRuntime) Create(ctx context.Context, spec SandboxSpec) (*SandboxHan
 	pod := r.buildPod(spec, pvcName)
 	created, err := r.cs.CoreV1().Pods(r.namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
+		// Keep Create atomic: roll back the PVC and CA secret we just created so
+		// a rejected/failed pod (e.g. missing RuntimeClass, quota) does not leak
+		// resources on every retry.
+		bg := context.Background()
+		_ = r.deleteCASecret(bg, spec.SessionID)
+		_ = r.cs.CoreV1().PersistentVolumeClaims(r.namespace).Delete(bg, pvcName, metav1.DeleteOptions{})
 		return nil, fmt.Errorf("create pod %q: %w", pod.Name, err)
 	}
 	return handleFromPod(created), nil
@@ -207,11 +213,12 @@ func (r *KubeRuntime) buildPod(spec SandboxSpec, pvcName string) *corev1.Pod {
 	}
 
 	container := corev1.Container{
-		Name:         "sandbox",
-		Image:        imageOrDefault(spec.Image, r.sc.DefaultImage),
-		Command:      []string{"/bin/sh", "-c", sandboxInitScript},
-		VolumeMounts: mounts,
-		Env:          append(proxyEnv(spec.ProxyEndpoint), caTrustEnv(len(spec.CACert) > 0, r.sc.CACertPath)...),
+		Name:            "sandbox",
+		Image:           imageOrDefault(spec.Image, r.sc.DefaultImage),
+		ImagePullPolicy: imagePullPolicy(r.sc.ImagePullPolicy),
+		Command:         []string{"/bin/sh", "-c", sandboxInitScript},
+		VolumeMounts:    mounts,
+		Env:             append(proxyEnv(spec.ProxyEndpoint), caTrustEnv(len(spec.CACert) > 0, r.sc.CACertPath)...),
 		Resources: corev1.ResourceRequirements{
 			Limits: resourceList(r.sc.CPULimit, r.sc.MemoryLimit),
 		},
@@ -378,6 +385,15 @@ func imageOrDefault(image, fallback string) string {
 		return image
 	}
 	return fallback
+}
+
+func imagePullPolicy(policy string) corev1.PullPolicy {
+	switch corev1.PullPolicy(policy) {
+	case corev1.PullAlways, corev1.PullNever, corev1.PullIfNotPresent:
+		return corev1.PullPolicy(policy)
+	default:
+		return corev1.PullIfNotPresent
+	}
 }
 
 func stringPtrOrNil(value string) *string {

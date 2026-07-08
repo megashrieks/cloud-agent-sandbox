@@ -51,6 +51,10 @@ type SandboxConfig struct {
 	RunAsUser int64
 	// CACertPath is where the trusted proxy CA cert is mounted inside the pod.
 	CACertPath string
+	// ImagePullPolicy for the sandbox container ("IfNotPresent", "Always",
+	// "Never"). Defaults to "IfNotPresent" so locally loaded images (e.g. kind)
+	// are used without attempting a registry pull.
+	ImagePullPolicy string
 }
 
 // PoolConfig controls the warm pool and global scaling limits.
@@ -103,6 +107,7 @@ func Default() Config {
 			PidsLimit:        512,
 			RunAsUser:        1000,
 			CACertPath:       "/etc/sandbox/ca.crt",
+			ImagePullPolicy:  "IfNotPresent",
 		},
 		Pool: PoolConfig{
 			MinIdleReady: 2,
@@ -132,8 +137,9 @@ func Load() (Config, error) {
 	c.Kube.Namespace = env("SANDBOX_NAMESPACE", c.Kube.Namespace)
 
 	c.Sandbox.DefaultImage = env("SANDBOX_DEFAULT_IMAGE", c.Sandbox.DefaultImage)
-	c.Sandbox.RuntimeClass = env("SANDBOX_RUNTIME_CLASS", c.Sandbox.RuntimeClass)
+	c.Sandbox.RuntimeClass = envAllowEmpty("SANDBOX_RUNTIME_CLASS", c.Sandbox.RuntimeClass)
 	c.Sandbox.KataRuntimeClass = env("SANDBOX_KATA_RUNTIME_CLASS", c.Sandbox.KataRuntimeClass)
+	c.Sandbox.ImagePullPolicy = env("SANDBOX_IMAGE_PULL_POLICY", c.Sandbox.ImagePullPolicy)
 	c.Sandbox.WorkspaceSize = env("SANDBOX_WORKSPACE_SIZE", c.Sandbox.WorkspaceSize)
 
 	var err error
@@ -172,6 +178,16 @@ func (c Config) Validate() error {
 
 func env(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
+}
+
+// envAllowEmpty returns the env value when the variable is set, even to an empty
+// string, so an operator can explicitly clear a defaulted value (e.g. set
+// SANDBOX_RUNTIME_CLASS="" to disable gVisor and use the hardened baseline).
+func envAllowEmpty(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
 		return v
 	}
 	return def

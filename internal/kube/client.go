@@ -24,6 +24,15 @@ func New(kubeconfig string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The default client-go limiter (5 QPS / 10 burst) is too low for the warm
+	// pool + reaper + WaitReady polling, causing "rate limiter Wait ... context
+	// deadline exceeded" under load. Raise it for a control-plane component.
+	if cfg.QPS == 0 {
+		cfg.QPS = 50
+	}
+	if cfg.Burst == 0 {
+		cfg.Burst = 100
+	}
 	cs, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("build clientset: %w", err)

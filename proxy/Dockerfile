@@ -11,9 +11,13 @@ RUN mkdir -p /addons /home/mitmproxy/.mitmproxy \
     && chown -R mitmproxy:mitmproxy /addons /home/mitmproxy
 
 COPY addons/inject.py /addons/inject.py
-RUN chown mitmproxy:mitmproxy /addons/inject.py
+COPY start.sh /usr/local/bin/start.sh
+RUN chown mitmproxy:mitmproxy /addons/inject.py \
+    && chmod +x /usr/local/bin/start.sh
 
 USER mitmproxy
 EXPOSE 8080
 
-CMD ["mitmdump", "--listen-port", "8080", "-s", "/addons/inject.py", "--set", "confdir=/home/mitmproxy/.mitmproxy"]
+# Bypass the base image's root-only usermod entrypoint; run mitmdump directly.
+ENTRYPOINT ["/usr/local/bin/start.sh"]
+CMD []

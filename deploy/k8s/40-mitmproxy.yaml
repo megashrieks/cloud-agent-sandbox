@@ -22,6 +22,8 @@ spec:
         app: mitmproxy
     spec:
       automountServiceAccountToken: false
+      securityContext:
+        fsGroup: 1000
       containers:
         - name: mitmproxy
           image: ghcr.io/megashrieks/sandbox-mitmproxy:latest
@@ -66,6 +68,8 @@ spec:
               value: /run/secrets/github-app/private-key.pem
           securityContext:
             runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
@@ -79,12 +83,15 @@ spec:
               cpu: "1"
               memory: "512Mi"
           volumeMounts:
-            # Shared CA (cert + key) so every replica impersonates upstreams
-            # with the SAME CA that the orchestrator injects into sandboxes.
-            # Provisioned by the orchestrator's EnsureCASecret at startup.
+            # Shared CA (cert + key), mounted read-only. Copied into the writable
+            # confdir at startup so mitmproxy signs with the SAME CA that the
+            # orchestrator injects into sandboxes. Provisioned by EnsureCASecret.
             - name: ca
-              mountPath: /home/mitmproxy/.mitmproxy
+              mountPath: /ca
               readOnly: true
+            # Writable confdir for mitmproxy runtime files.
+            - name: confdir
+              mountPath: /home/mitmproxy/.mitmproxy
             # GitHub App private key (only used when App auth is configured).
             - name: github-app-key
               mountPath: /run/secrets/github-app
@@ -93,6 +100,8 @@ spec:
         - name: ca
           secret:
             secretName: mitmproxy-ca
+        - name: confdir
+          emptyDir: {}
         - name: github-app-key
           secret:
             # Create with: kubectl -n sandboxes create secret generic \
