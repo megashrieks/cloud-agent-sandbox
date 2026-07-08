@@ -1,0 +1,80 @@
+# The orchestrator: serves the REST API + streamable-HTTP MCP endpoint and
+# manages sandbox lifecycle via the Kubernetes API.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orchestrator
+  namespace: sandboxes
+  labels:
+    app: orchestrator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orchestrator
+  template:
+    metadata:
+      labels:
+        app: orchestrator
+    spec:
+      serviceAccountName: orchestrator
+      automountServiceAccountToken: true
+      containers:
+        - name: orchestrator
+          image: ghcr.io/megashrieks/sandbox-orchestrator:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: SANDBOX_LISTEN_ADDR
+              value: ":8080"
+            - name: SANDBOX_NAMESPACE
+              value: "sandboxes"
+            - name: SANDBOX_RUNTIME_CLASS
+              value: "gvisor"
+            - name: SANDBOX_DEFAULT_IMAGE
+              value: "ghcr.io/megashrieks/sandbox-default:latest"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator
+  namespace: sandboxes
+  labels:
+    app: orchestrator
+spec:
+  selector:
+    app: orchestrator
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

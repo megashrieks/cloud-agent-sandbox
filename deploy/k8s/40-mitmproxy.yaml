@@ -1,0 +1,75 @@
+# MITM proxy pool (pool-per-group topology). Each replica is an interception
+# proxy that injects credentials for approved hosts. TOKENS live ONLY here,
+# configured by the user (edit proxy/addons/inject.py or mount a secret).
+#
+# The orchestrator assigns sandboxes to a proxy instance and injects that
+# instance's address as HTTPS_PROXY plus the proxy CA cert into the sandbox.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mitmproxy
+  namespace: sandboxes
+  labels:
+    app: mitmproxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mitmproxy
+  template:
+    metadata:
+      labels:
+        app: mitmproxy
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: mitmproxy
+          image: ghcr.io/megashrieks/sandbox-mitmproxy:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: proxy
+          env:
+            # Users supply tokens here (or via a mounted secret referenced by
+            # the addon). These are the ONLY place real credentials exist.
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mitmproxy-tokens
+                  key: github-token
+                  optional: true
+            - name: GITLAB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: mitmproxy-tokens
+                  key: gitlab-token
+                  optional: true
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mitmproxy
+  namespace: sandboxes
+  labels:
+    app: mitmproxy
+spec:
+  selector:
+    app: mitmproxy
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP

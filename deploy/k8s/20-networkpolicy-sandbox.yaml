@@ -1,0 +1,41 @@
+# Default-deny egress for all sandbox pods. Untrusted code must not reach the
+# internet, the cluster API, other pods, or metadata endpoints directly. The
+# ONLY permitted egress is to the MITM proxy pool (which the user configures and
+# which injects credentials). DNS is allowed so hostnames resolve.
+#
+# Sandbox pods carry the label app=sandbox (set by the runtime). The proxy pool
+# carries app=mitmproxy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-default-deny-egress
+  namespace: sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      app: sandbox
+  policyTypes:
+    - Egress
+    - Ingress
+  # Ingress: nothing may connect INTO a sandbox.
+  ingress: []
+  egress:
+    # Allow DNS resolution (kube-dns / CoreDNS).
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow egress ONLY to the MITM proxy pool.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: mitmproxy
+      ports:
+        - protocol: TCP
+          port: 8080

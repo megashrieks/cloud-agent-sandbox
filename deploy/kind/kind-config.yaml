@@ -1,0 +1,22 @@
+# kind cluster for local development.
+#
+# gVisor note: running gVisor inside kind requires the runsc shim in the node
+# image (kind nodes are containers). For pure local iteration you can omit the
+# RuntimeClass (set SANDBOX_RUNTIME_CLASS="") to fall back to the hardened
+# baseline runtime, then move to a gVisor/Kata-capable cluster for real
+# isolation. See docs/local-dev.md.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: sandbox-dev
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      # Expose the orchestrator (NodePort or port-forward is also fine).
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+networking:
+  # A CNI that enforces NetworkPolicy is required for egress containment.
+  # kind's default kindnet does NOT enforce NetworkPolicy, install Calico or
+  # Cilium for the closed-network guarantee. See docs/local-dev.md.
+  disableDefaultCNI: false

@@ -1,0 +1,20 @@
+# Isolation runtimes exposed to the orchestrator via RuntimeClass.
+# gVisor (runsc) is the DEFAULT sandbox runtime: a user-space kernel that
+# shrinks the host kernel attack surface for untrusted code.
+#
+# Prerequisite: the runsc/gVisor containerd shim must be installed on nodes and
+# registered as a containerd runtime handler named "runsc".
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+---
+# Kata Containers: stronger, VM-grade isolation (each sandbox gets its own
+# kernel). Opt-in for high-risk tenants. Requires bare-metal / nested-virt nodes
+# and the kata containerd shim registered as handler "kata".
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata
+handler: kata
