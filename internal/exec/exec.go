@@ -47,6 +47,8 @@ type Job struct {
 	Running   bool
 	ExitCode  int
 	StartedAt time.Time
+	// FinishedAt is set once the job's process is observed to have exited.
+	FinishedAt time.Time
 }
 
 // FileInfo is a single directory entry.

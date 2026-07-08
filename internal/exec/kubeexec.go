@@ -26,6 +26,13 @@ const (
 	commandOutputLimit   = 1 << 20
 	fileReadLimit        = 5 << 20
 	jobLogLimit          = 1 << 20
+	// jobRetention is how long a finished job is remembered (so a final poll
+	// can still fetch its exit status/log) before it is reaped from memory.
+	jobRetention = 15 * time.Minute
+	// jobHardTTL bounds memory for jobs that are never polled to completion:
+	// any job older than this is reaped unconditionally. It comfortably exceeds
+	// the running-container lifetime, so the underlying process is long gone.
+	jobHardTTL = 2 * time.Hour
 )
 
 // KubeExecutor runs sandbox operations through the Kubernetes pods/exec
@@ -167,9 +174,25 @@ func (e *KubeExecutor) StartJob(ctx context.Context, cmd Command) (*Job, error) 
 
 	job := &Job{ID: id, PodName: cmd.PodName, PID: pid, LogFile: logFile, Running: true, StartedAt: time.Now()}
 	e.mu.Lock()
+	e.reapJobsLocked()
 	e.jobs[id] = cloneJob(job)
 	e.mu.Unlock()
 	return cloneJob(job), nil
+}
+
+// reapJobsLocked evicts finished jobs past their retention window and any job
+// older than the hard TTL. Callers must hold e.mu.
+func (e *KubeExecutor) reapJobsLocked() {
+	now := time.Now()
+	for id, j := range e.jobs {
+		if !j.FinishedAt.IsZero() && now.Sub(j.FinishedAt) > jobRetention {
+			delete(e.jobs, id)
+			continue
+		}
+		if now.Sub(j.StartedAt) > jobHardTTL {
+			delete(e.jobs, id)
+		}
+	}
 }
 
 // PollJob returns the latest remembered status plus the current job log.
@@ -186,6 +209,9 @@ func (e *KubeExecutor) PollJob(ctx context.Context, podName, jobID string) (*Job
 	job.Running = alive
 	if !alive {
 		job.ExitCode = 0
+		if job.FinishedAt.IsZero() {
+			job.FinishedAt = time.Now()
+		}
 	}
 
 	logOutput, err := e.readJobLog(ctx, job.PodName, job.LogFile)
@@ -224,6 +250,9 @@ func (e *KubeExecutor) StopJob(ctx context.Context, podName, jobID string) error
 	if stored != nil {
 		stored.Running = false
 		stored.ExitCode = 0
+		if stored.FinishedAt.IsZero() {
+			stored.FinishedAt = time.Now()
+		}
 	}
 	e.mu.Unlock()
 	return nil

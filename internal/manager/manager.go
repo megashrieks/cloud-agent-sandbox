@@ -170,14 +170,30 @@ func (m *Manager) Create(ctx context.Context, opts session.CreateOptions) (*sess
 	}
 
 	if err := m.rt.WaitReady(ctx, sess.PodName, m.readyTO); err != nil {
+		m.cleanupFailedCreate(sess)
 		return nil, fmt.Errorf("sandbox not ready: %w", err)
 	}
 
 	sess.State = session.StateRunning
 	if err := m.store.Update(ctx, sess); err != nil {
+		m.cleanupFailedCreate(sess)
 		return nil, fmt.Errorf("update session: %w", err)
 	}
 	return sess, nil
+}
+
+// cleanupFailedCreate tears down the pod/PVC and proxy assignment for a session
+// that was persisted but never became Ready, and marks it Dead so it stops
+// counting toward the MaxRunning cap. Uses a background context so cleanup still
+// runs when the caller's context has been cancelled or timed out.
+func (m *Manager) cleanupFailedCreate(sess *session.Session) {
+	ctx := context.Background()
+	_ = m.rt.Purge(ctx, sess.PodName, sess.PVCName)
+	if m.proxy != nil {
+		m.proxy.Release(ctx, sess.ID)
+	}
+	sess.State = session.StateDead
+	_ = m.store.Update(ctx, sess)
 }
 
 // Get returns a session by id, or session.ErrInvalidSession if unknown.
@@ -263,14 +279,30 @@ func (m *Manager) Resume(ctx context.Context, id string) (*session.Session, erro
 	s.PodName = handle.PodName
 	s.State = session.StateCreating
 	if err := m.store.Update(ctx, s); err != nil {
+		m.cleanupFailedResume(s)
 		return nil, err
 	}
 	if err := m.rt.WaitReady(ctx, s.PodName, m.readyTO); err != nil {
+		m.cleanupFailedResume(s)
 		return nil, fmt.Errorf("resumed sandbox not ready: %w", err)
 	}
 	s.State = session.StateRunning
 	s.LastActivityAt = time.Now()
 	return s, m.store.Update(ctx, s)
+}
+
+// cleanupFailedResume deletes the freshly-created pod (retaining the workspace
+// PVC) and releases the proxy for a resume that never became Ready, restoring
+// the session to StateStopped so it can be resumed again later.
+func (m *Manager) cleanupFailedResume(s *session.Session) {
+	ctx := context.Background()
+	_ = m.rt.Stop(ctx, s.PodName)
+	if m.proxy != nil {
+		m.proxy.Release(ctx, s.ID)
+	}
+	s.PodName = ""
+	s.State = session.StateStopped
+	_ = m.store.Update(ctx, s)
 }
 
 // Delete purges the sandbox (pod + workspace) and marks the session dead.
