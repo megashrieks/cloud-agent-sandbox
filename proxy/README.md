@@ -13,6 +13,39 @@ The default addon strips client-supplied credential headers and injects proxy-ow
 
 Token values are never logged.
 
+## GitHub App authentication (installation tokens)
+
+Instead of a static PAT, you can authenticate as a **GitHub App**. A GitHub App
+has no static token; the proxy signs a short-lived JWT with the App's private key
+and exchanges it for an **installation access token** (valid ~1h), caching and
+refreshing it automatically. The private key never leaves the proxy.
+
+Provide (via env vars / mounted secret) and leave `GITHUB_TOKEN` unset:
+
+| Variable | Meaning |
+|----------|---------|
+| `GITHUB_APP_ID` | The App's numeric id. Enables App auth when set. |
+| `GITHUB_APP_PRIVATE_KEY` | The App private key PEM inline, **or** |
+| `GITHUB_APP_PRIVATE_KEY_FILE` | Path to a mounted `.pem` file (default `/run/secrets/github-app/private-key.pem` in the Deployment). |
+| `GITHUB_APP_INSTALLATION_ID` | Optional. If omitted, the App's first installation is auto-discovered. |
+
+When `GITHUB_APP_ID` is set, the `github.com` token key resolves to a freshly
+minted installation token, so the existing `github.com` (git) and
+`api.github.com` (`gh`) rules work unchanged. The App must be **installed** on the
+target repo/org, and its permissions must include **Contents: Read & write** and
+**Pull requests: Read & write** for the clone/commit/push/PR flow.
+
+Deploy example:
+
+```bash
+kubectl -n sandboxes create secret generic github-app-key \
+  --from-file=private-key.pem=/path/to/app.private-key.pem
+kubectl -n sandboxes create secret generic mitmproxy-tokens \
+  --from-literal=github-app-id=123456 \
+  --from-literal=github-app-installation-id=7890123   # optional
+kubectl -n sandboxes rollout restart deploy/mitmproxy
+```
+
 ## Customizing hosts and tokens
 
 Edit `addons/inject.py` in the `USER CONFIG` section only:

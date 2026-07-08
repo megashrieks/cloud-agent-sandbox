@@ -32,6 +32,11 @@ spec:
           env:
             # Users supply tokens here (or via a mounted secret referenced by
             # the addon). These are the ONLY place real credentials exist.
+            #
+            # Option A: static PAT, set the github-token key on mitmproxy-tokens.
+            # Option B: GitHub App, set app-id (+ optional installation-id) and
+            #           mount the App private key (see the volume below). Leave
+            #           github-token unset when using an App.
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -44,6 +49,21 @@ spec:
                   name: mitmproxy-tokens
                   key: gitlab-token
                   optional: true
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: mitmproxy-tokens
+                  key: github-app-id
+                  optional: true
+            - name: GITHUB_APP_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: mitmproxy-tokens
+                  key: github-app-installation-id
+                  optional: true
+            # Path to the mounted GitHub App private key PEM (see volume below).
+            - name: GITHUB_APP_PRIVATE_KEY_FILE
+              value: /run/secrets/github-app/private-key.pem
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false
@@ -65,10 +85,20 @@ spec:
             - name: ca
               mountPath: /home/mitmproxy/.mitmproxy
               readOnly: true
+            # GitHub App private key (only used when App auth is configured).
+            - name: github-app-key
+              mountPath: /run/secrets/github-app
+              readOnly: true
       volumes:
         - name: ca
           secret:
             secretName: mitmproxy-ca
+        - name: github-app-key
+          secret:
+            # Create with: kubectl -n sandboxes create secret generic \
+            #   github-app-key --from-file=private-key.pem=/path/to/app.private-key.pem
+            secretName: github-app-key
+            optional: true
 ---
 apiVersion: v1
 kind: Service
