@@ -7,18 +7,20 @@ This directory contains the curated default image for code sandboxes. It is inte
 The image is based on `debian:stable-slim` and installs:
 
 - `git`
-- `curl`
+- `gh` (GitHub CLI)
+- `curl`, `wget`
 - `ca-certificates`
 - `openssh-client`
-- `python3`
-- `python3-pip`
+- `python3`, `python3-pip`
 - `nodejs` and `npm`
 - `build-essential`
-- `jq`
-- `ripgrep`
+- Data manipulation: `jq`, `ripgrep`, `grep`, `sed`, `gawk`, `findutils`, `coreutils`, `diffutils`, `patch`
+- Archives: `tar`, `gzip`, `bzip2`, `xz-utils`, `zip`, `unzip`
 - `less`
-- `tar`
-- `gzip`
+
+> `gh` and `git` route their HTTPS traffic through the MITM proxy, which injects
+> credentials. For `gh` API calls to work, the proxy addon's host rules must
+> cover `api.github.com` (and the sandbox must trust the injected CA, see below).
 
 ## Runtime conventions
 

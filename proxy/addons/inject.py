@@ -53,6 +53,19 @@ HOST_RULES: dict[str, dict[str, Any]] = {
         "scheme": "basic",
         "basic_username": "x-access-token",
     },
+    # GitHub REST/GraphQL API, used by the `gh` CLI. Same token as git-over-HTTPS,
+    # injected as a bearer token so `gh auth status`, `gh pr create`, etc. work
+    # without the sandbox ever seeing the credential.
+    "api.github.com": {
+        "token_key": "github.com",
+        "scheme": "bearer",
+    },
+    # `gh` and git may also reach these GitHub hosts (archive/asset/LFS/upload
+    # endpoints). Uncomment and add them to the allowlist if your workflow needs
+    # authenticated access:
+    # "codeload.github.com": {"token_key": "github.com", "scheme": "basic", "basic_username": "x-access-token"},
+    # "uploads.github.com": {"token_key": "github.com", "scheme": "bearer"},
+    # "objects.githubusercontent.com": {"token_key": "github.com", "scheme": "bearer"},
     # GitLab accepts OAuth/PAT tokens as Bearer for many APIs and git-over-HTTPS.
     # If your GitLab deployment requires PRIVATE-TOKEN instead, change this rule to:
     #   "scheme": "header", "header_name": "PRIVATE-TOKEN"
