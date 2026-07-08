@@ -40,12 +40,12 @@ type Result struct {
 
 // Job is a handle to a background (async) command.
 type Job struct {
-	ID      string
-	PodName string
-	PID     int
-	LogFile string
-	Running bool
-	ExitCode int
+	ID        string
+	PodName   string
+	PID       int
+	LogFile   string
+	Running   bool
+	ExitCode  int
 	StartedAt time.Time
 }
 
