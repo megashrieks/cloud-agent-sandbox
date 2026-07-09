@@ -21,7 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/config"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/config"
 )
 
 // CASecretName is the Secret holding the shared proxy CA (cert + key). The

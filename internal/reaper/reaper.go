@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/manager"
-	"github.com/megashrieks/sandbox-orchestrator/internal/session"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/manager"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/session"
 )
 
 // Reaper periodically stops idle running sandboxes and purges old stopped ones.

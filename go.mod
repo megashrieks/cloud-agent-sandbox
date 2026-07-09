@@ -1,4 +1,4 @@
-module github.com/megashrieks/sandbox-orchestrator
+module github.com/megashrieks/cloud-agent-sandbox
 
 go 1.25.5
 

@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/config"
-	"github.com/megashrieks/sandbox-orchestrator/internal/runtime"
-	"github.com/megashrieks/sandbox-orchestrator/internal/session"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/config"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/runtime"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/session"
 )
 
 // Pool is a warm pool of pre-created, ready sandboxes that can be claimed to

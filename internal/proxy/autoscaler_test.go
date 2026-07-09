@@ -11,7 +11,7 @@ import (
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/config"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/config"
 )
 
 func newTestAutoscaler(cs *fake.Clientset, per, minR, maxR int) *Autoscaler {

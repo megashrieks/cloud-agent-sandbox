@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/config"
-	"github.com/megashrieks/sandbox-orchestrator/internal/manager"
-	"github.com/megashrieks/sandbox-orchestrator/internal/runtime"
-	"github.com/megashrieks/sandbox-orchestrator/internal/session"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/config"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/manager"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/runtime"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/session"
 )
 
 type fakeRuntime struct {

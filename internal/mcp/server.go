@@ -11,9 +11,9 @@ import (
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
-	"github.com/megashrieks/sandbox-orchestrator/internal/exec"
-	"github.com/megashrieks/sandbox-orchestrator/internal/manager"
-	"github.com/megashrieks/sandbox-orchestrator/internal/session"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/exec"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/manager"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/session"
 )
 
 // Server exposes sandbox operations as Model Context Protocol tools.

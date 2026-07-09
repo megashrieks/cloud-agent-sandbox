@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/config"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/config"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"

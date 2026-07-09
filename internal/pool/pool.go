@@ -7,9 +7,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/megashrieks/sandbox-orchestrator/internal/config"
-	"github.com/megashrieks/sandbox-orchestrator/internal/manager"
-	"github.com/megashrieks/sandbox-orchestrator/internal/runtime"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/config"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/manager"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/runtime"
 )
 
 var _ manager.Pool = (*WarmPool)(nil)

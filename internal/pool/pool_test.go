@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/config"
-	"github.com/megashrieks/sandbox-orchestrator/internal/runtime"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/config"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/runtime"
 )
 
 type fakeRuntime struct {

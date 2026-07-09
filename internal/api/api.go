@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/manager"
-	"github.com/megashrieks/sandbox-orchestrator/internal/session"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/manager"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/session"
 )
 
 // Handler serves the REST API backed by a Manager.

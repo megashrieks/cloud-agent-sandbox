@@ -10,7 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/megashrieks/sandbox-orchestrator/internal/config"
+	"github.com/megashrieks/cloud-agent-sandbox/internal/config"
 )
 
 // sandboxSelector matches sandbox pods (warm-pool + running). The autoscaler
