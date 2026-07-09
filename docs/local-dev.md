@@ -31,17 +31,24 @@ runtime registered as handler `runsc`, then keep `SANDBOX_RUNTIME_CLASS=gvisor`.
 ## 2. Build & load images
 
 ```bash
-# Orchestrator
-docker build -t ghcr.io/megashrieks/sandbox-orchestrator:latest .
-# MITM proxy
-docker build -t ghcr.io/megashrieks/sandbox-mitmproxy:latest ./proxy
-# Default sandbox image
-docker build -t ghcr.io/megashrieks/sandbox-default:latest ./images/default
+# Set your registry namespace (e.g. ghcr.io/<your-user>, docker.io/<your-user>, or a local name)
+REGISTRY=ghcr.io/megashrieks
 
-kind load docker-image ghcr.io/megashrieks/sandbox-orchestrator:latest --name sandbox-dev
-kind load docker-image ghcr.io/megashrieks/sandbox-mitmproxy:latest --name sandbox-dev
-kind load docker-image ghcr.io/megashrieks/sandbox-default:latest --name sandbox-dev
+# Orchestrator
+docker build -t $REGISTRY/sandbox-orchestrator:latest .
+# MITM proxy
+docker build -t $REGISTRY/sandbox-mitmproxy:latest ./proxy
+# Default sandbox image
+docker build -t $REGISTRY/sandbox-default:latest ./images/default
+
+kind load docker-image $REGISTRY/sandbox-orchestrator:latest --name sandbox-dev
+kind load docker-image $REGISTRY/sandbox-mitmproxy:latest --name sandbox-dev
+kind load docker-image $REGISTRY/sandbox-default:latest --name sandbox-dev
 ```
+
+If you change `REGISTRY`, update the image references in `deploy/k8s/40-mitmproxy.yaml`,
+`deploy/k8s/50-orchestrator.yaml` (including the `SANDBOX_DEFAULT_IMAGE` env), or override the
+default image at runtime with `SANDBOX_DEFAULT_IMAGE`.
 
 ## 3. Configure tokens (proxy-only)
 
