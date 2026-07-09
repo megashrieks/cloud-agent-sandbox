@@ -21,7 +21,7 @@ spec:
       automountServiceAccountToken: true
       containers:
         - name: orchestrator
-          image: ghcr.io/megashrieks/sandbox-orchestrator:latest
+          image: sandbox-orchestrator:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -34,7 +34,7 @@ spec:
             - name: SANDBOX_RUNTIME_CLASS
               value: "gvisor"
             - name: SANDBOX_DEFAULT_IMAGE
-              value: "ghcr.io/megashrieks/sandbox-default:latest"
+              value: "sandbox-default:latest"
           readinessProbe:
             httpGet:
               path: /healthz

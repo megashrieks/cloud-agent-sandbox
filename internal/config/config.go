@@ -168,7 +168,7 @@ func Default() Config {
 			Namespace: "sandboxes",
 		},
 		Sandbox: SandboxConfig{
-			DefaultImage:     "ghcr.io/megashrieks/sandbox-default:latest",
+			DefaultImage:     "sandbox-default:latest",
 			RuntimeClass:     "gvisor",
 			KataRuntimeClass: "kata",
 			WorkspacePath:    "/workspace",
