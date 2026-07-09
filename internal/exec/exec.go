@@ -44,6 +44,12 @@ type Job struct {
 	PodName   string
 	PID       int
 	LogFile   string
+	// RCFile holds the path of the exit-code sentinel written when the job's
+	// command completes. Its presence (non-empty content) is the authoritative
+	// "finished" signal, and its content is the real exit code. It exists
+	// because the sandbox PID 1 (sleep infinity) never reaps children, so a
+	// finished job lingers as a zombie whose PID still answers `kill -0`.
+	RCFile    string
 	Running   bool
 	ExitCode  int
 	StartedAt time.Time

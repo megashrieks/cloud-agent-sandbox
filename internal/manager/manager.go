@@ -11,6 +11,9 @@ package manager
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/megashrieks/sandbox-orchestrator/internal/config"
@@ -51,6 +54,15 @@ type ProxyAssigner interface {
 	Release(ctx context.Context, sessionID string)
 }
 
+// ProxyScaler ensures MITM proxy capacity is available on demand. Implemented
+// by internal/proxy's Autoscaler. Optional: when nil the orchestrator assumes a
+// statically-provisioned proxy.
+type ProxyScaler interface {
+	// EnsureReady scales the proxy up if needed and blocks until at least one
+	// proxy replica is Ready, so a sandbox about to start can reach it.
+	EnsureReady(ctx context.Context) error
+}
+
 // Manager owns sandbox session lifecycle.
 type Manager struct {
 	cfg     config.Config
@@ -58,7 +70,13 @@ type Manager struct {
 	rt      runtime.Runtime
 	pool    Pool
 	proxy   ProxyAssigner
+	scaler  ProxyScaler
 	readyTO time.Duration
+
+	// activeMu guards active, which counts in-flight MCP calls per session so
+	// the reaper never treats a session with a running tool call as idle.
+	activeMu sync.Mutex
+	active   map[string]int
 }
 
 // New builds a Manager. pool and proxy may be nil for degraded/dev modes
@@ -71,6 +89,7 @@ func New(cfg config.Config, store session.Store, rt runtime.Runtime, pool Pool, 
 		pool:    pool,
 		proxy:   proxy,
 		readyTO: 90 * time.Second,
+		active:  make(map[string]int),
 	}
 }
 
@@ -84,13 +103,114 @@ func (m *Manager) Runtime() runtime.Runtime { return m.rt }
 // Config exposes the effective configuration.
 func (m *Manager) Config() config.Config { return m.cfg }
 
+// SetProxyScaler wires an optional on-demand proxy autoscaler. When set,
+// Create asks it to ensure proxy capacity before starting a sandbox.
+func (m *Manager) SetProxyScaler(s ProxyScaler) { m.scaler = s }
+
+// resolveImage maps friendly aliases to concrete image references. An empty
+// string or the alias "default" resolves to the configured DefaultImage, so
+// callers (e.g. LLM tool calls) that pass image:"default" don't end up trying
+// to pull docker.io/library/default:latest, which does not exist and would
+// leave the pod in ImagePullBackOff until the ready deadline is exceeded.
+func (m *Manager) resolveImage(image string) string {
+	switch strings.TrimSpace(image) {
+	case "", "default", "sandbox-default":
+		return m.cfg.Sandbox.DefaultImage
+	default:
+		return image
+	}
+}
+
+// resolveBool returns the pointer's value when set, else the default. Used to
+// let per-session CreateOptions override the configured posture (writable-root,
+// run-as-root) while defaulting to the orchestrator's configuration.
+func resolveBool(override *bool, def bool) bool {
+	if override != nil {
+		return *override
+	}
+	return def
+}
+
+// SweepOrphans reconciles the platform against the (in-memory) session store
+// and removes sandboxes/workspaces the store no longer knows about. This is the
+// self-healing counterpart to the reaper: because the store is in-memory and
+// wiped on every orchestrator restart, any pod/PVC created before a restart is
+// no longer tracked and would otherwise live forever. Warm-pool resources and
+// resources still tracked by the store are left alone; tracked ones are handled
+// by the normal reaper path.
+//
+// An orphan pod older than MaxLifetime is purged (pod + PVC). An orphan PVC with
+// no backing pod, older than StoppedTTL, is deleted.
+func (m *Manager) SweepOrphans(ctx context.Context) {
+	now := time.Now()
+
+	known := make(map[string]bool)
+	if all, err := m.store.List(ctx); err != nil {
+		slog.Error("sweep orphans: list sessions", "error", err)
+		return
+	} else {
+		for _, s := range all {
+			known[s.ID] = true
+		}
+	}
+
+	pods, err := m.rt.ListSandboxes(ctx)
+	if err != nil {
+		slog.Error("sweep orphans: list sandboxes", "error", err)
+		return
+	}
+
+	livePodSession := make(map[string]bool, len(pods))
+	maxLife := m.cfg.Lifetime.MaxLifetime
+	for _, p := range pods {
+		livePodSession[p.SessionID] = true
+		if p.Pool || known[p.SessionID] {
+			continue
+		}
+		// Grace: never touch a pod younger than the max-lifetime cap, so we
+		// cannot race a just-created session that isn't in the store yet.
+		if maxLife > 0 && now.Sub(p.CreatedAt) <= maxLife {
+			continue
+		}
+		if err := m.rt.Purge(ctx, p.PodName, p.PVCName); err != nil {
+			slog.Error("sweep orphans: purge orphan pod", "pod", p.PodName, "error", err)
+			continue
+		}
+		if m.proxy != nil && p.SessionID != "" {
+			m.proxy.Release(ctx, p.SessionID)
+		}
+		slog.Info("purged orphan sandbox pod", "pod", p.PodName, "session_id", p.SessionID,
+			"created_at", p.CreatedAt, "age", now.Sub(p.CreatedAt).String())
+	}
+
+	workspaces, err := m.rt.ListWorkspaces(ctx)
+	if err != nil {
+		slog.Error("sweep orphans: list workspaces", "error", err)
+		return
+	}
+	stoppedTTL := m.cfg.Lifetime.StoppedTTL
+	for _, w := range workspaces {
+		if w.Pool || known[w.SessionID] || livePodSession[w.SessionID] {
+			continue
+		}
+		if stoppedTTL > 0 && now.Sub(w.CreatedAt) <= stoppedTTL {
+			continue
+		}
+		if err := m.rt.Purge(ctx, w.PodName, w.PVCName); err != nil {
+			slog.Error("sweep orphans: delete orphan pvc", "pvc", w.PVCName, "error", err)
+			continue
+		}
+		slog.Info("purged orphan workspace pvc", "pvc", w.PVCName, "session_id", w.SessionID,
+			"created_at", w.CreatedAt, "age", now.Sub(w.CreatedAt).String())
+	}
+}
+
 // Create provisions a new sandbox session and returns it once the sandbox is
 // ready for exec.
 func (m *Manager) Create(ctx context.Context, opts session.CreateOptions) (*session.Session, error) {
-	image := opts.Image
-	if image == "" {
-		image = m.cfg.Sandbox.DefaultImage
-	}
+	image := m.resolveImage(opts.Image)
+	writableRoot := resolveBool(opts.WritableRoot, m.cfg.Sandbox.WritableRootFilesystem)
+	runAsRoot := resolveBool(opts.RunAsRoot, m.cfg.Sandbox.RunAsRoot)
 
 	// Enforce the global running cap.
 	running, err := m.store.ListByState(ctx, session.StateRunning)
@@ -129,11 +249,26 @@ func (m *Manager) Create(ctx context.Context, opts session.CreateOptions) (*sess
 			return nil, fmt.Errorf("assign proxy: %w", perr)
 		}
 		endpoint, caCert, sess.ProxyID = ep, ca, proxyID
+
+		// Ensure proxy capacity is up and Ready before the sandbox starts
+		// sending egress (scale-from-zero on demand).
+		if m.scaler != nil {
+			if serr := m.scaler.EnsureReady(ctx); serr != nil {
+				m.proxy.Release(ctx, id)
+				return nil, fmt.Errorf("ensure proxy ready: %w", serr)
+			}
+		}
 	}
 
 	// Try the warm pool first (default image only; warm pods are generic and
-	// already wired to the shared proxy Service + CA).
-	if m.pool != nil && image == m.cfg.Sandbox.DefaultImage {
+	// already wired to the shared proxy Service + CA). Only reuse a warm pod
+	// when the requested root/writable posture matches the pool's (which is
+	// built from the configured defaults). Otherwise cold-create so the pod's
+	// security context is correct.
+	poolEligible := image == m.cfg.Sandbox.DefaultImage &&
+		writableRoot == m.cfg.Sandbox.WritableRootFilesystem &&
+		runAsRoot == m.cfg.Sandbox.RunAsRoot
+	if m.pool != nil && poolEligible {
 		if handle, ok := m.pool.Acquire(ctx, image); ok {
 			sess.PodName = handle.PodName
 			sess.PVCName = handle.PVCName
@@ -149,6 +284,8 @@ func (m *Manager) Create(ctx context.Context, opts session.CreateOptions) (*sess
 			RuntimeClass:  runtimeClass,
 			ProxyEndpoint: endpoint,
 			CACert:        caCert,
+			RunAsRoot:     runAsRoot,
+			WritableRoot:  writableRoot,
 		})
 		if cerr != nil {
 			if m.proxy != nil {
@@ -219,6 +356,37 @@ func (m *Manager) Require(ctx context.Context, id string) (*session.Session, err
 // Touch records activity on a session (resets its idle timer).
 func (m *Manager) Touch(ctx context.Context, id string) error {
 	return m.store.Touch(ctx, id)
+}
+
+// BeginActivity marks the start of an in-flight MCP call for a session and
+// refreshes its idle timer. Pair every call with EndActivity (defer).
+func (m *Manager) BeginActivity(ctx context.Context, id string) {
+	m.activeMu.Lock()
+	m.active[id]++
+	m.activeMu.Unlock()
+	_ = m.store.Touch(ctx, id)
+}
+
+// EndActivity marks the end of an in-flight MCP call for a session and
+// refreshes its idle timer so the idle countdown starts from when the call
+// finished (not when it started).
+func (m *Manager) EndActivity(ctx context.Context, id string) {
+	m.activeMu.Lock()
+	if n := m.active[id]; n <= 1 {
+		delete(m.active, id)
+	} else {
+		m.active[id] = n - 1
+	}
+	m.activeMu.Unlock()
+	_ = m.store.Touch(ctx, id)
+}
+
+// HasActiveCalls reports whether a session currently has an in-flight MCP call.
+// The reaper uses this so an idle-timeout never fires mid-call.
+func (m *Manager) HasActiveCalls(id string) bool {
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	return m.active[id] > 0
 }
 
 // List returns all known sessions.

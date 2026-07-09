@@ -25,6 +25,12 @@ type SandboxSpec struct {
 	Labels map[string]string
 	// Warm indicates a pre-warmed pool sandbox not yet bound to a session.
 	Warm bool
+	// RunAsRoot runs the container as UID 0 (and disables RunAsNonRoot) so an
+	// arbitrary image can install system packages into itself.
+	RunAsRoot bool
+	// WritableRoot makes the container root filesystem writable (package
+	// installs). /workspace and /tmp are always writable regardless.
+	WritableRoot bool
 }
 
 // SandboxHandle identifies a created sandbox at the platform level.
@@ -35,6 +41,29 @@ type SandboxHandle struct {
 	Phase string
 	// Ready reports whether the sandbox is ready for exec.
 	Ready bool
+}
+
+// SandboxRef is a lightweight reference to an existing sandbox pod discovered
+// by listing the platform. Used for orphan reconciliation: because the session
+// store is in-memory and lost on orchestrator restart, pods created before a
+// restart are no longer tracked and must be swept directly from the platform.
+type SandboxRef struct {
+	PodName   string
+	PVCName   string
+	SessionID string
+	// Pool is true when the pod belongs to the warm pool (managed separately).
+	Pool      bool
+	CreatedAt time.Time
+}
+
+// WorkspaceRef references a retained workspace volume (PVC) discovered by
+// listing the platform, for orphan reconciliation.
+type WorkspaceRef struct {
+	PVCName   string
+	PodName   string
+	SessionID string
+	Pool      bool
+	CreatedAt time.Time
 }
 
 // Runtime creates and manages sandbox instances on a container platform.
@@ -53,4 +82,9 @@ type Runtime interface {
 	Purge(ctx context.Context, podName, pvcName string) error
 	// Get returns the current handle/status for a pod.
 	Get(ctx context.Context, podName string) (*SandboxHandle, error)
+	// ListSandboxes returns all sandbox pods currently on the platform. Used to
+	// reconcile orphans that outlived the in-memory session store.
+	ListSandboxes(ctx context.Context) ([]SandboxRef, error)
+	// ListWorkspaces returns all retained workspace PVCs on the platform.
+	ListWorkspaces(ctx context.Context) ([]WorkspaceRef, error)
 }

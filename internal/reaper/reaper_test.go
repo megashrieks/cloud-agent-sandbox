@@ -48,6 +48,14 @@ func (f *fakeRuntime) Get(ctx context.Context, podName string) (*runtime.Sandbox
 	return &runtime.SandboxHandle{PodName: podName, Ready: true}, nil
 }
 
+func (f *fakeRuntime) ListSandboxes(ctx context.Context) ([]runtime.SandboxRef, error) {
+	return nil, nil
+}
+
+func (f *fakeRuntime) ListWorkspaces(ctx context.Context) ([]runtime.WorkspaceRef, error) {
+	return nil, nil
+}
+
 func TestReapOnceStopsIdleRunningAndPurgesOldStopped(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 8, 20, 0, 0, 0, time.UTC)
@@ -117,11 +125,20 @@ func TestReapOnceStopsIdleRunningAndPurgesOldStopped(t *testing.T) {
 func TestExpirationHelpersRequireStrictlyOlderThanTTL(t *testing.T) {
 	now := time.Date(2026, 7, 8, 20, 0, 0, 0, time.UTC)
 
-	if runningExpired(&session.Session{State: session.StateRunning, LastActivityAt: now.Add(-time.Hour)}, now, time.Hour) {
-		t.Fatal("running session at exactly the TTL should not be expired")
+	cfg := config.Default()
+	cfg.Lifetime.RunningTTL = time.Hour
+	cfg.Lifetime.MaxLifetime = 100 * time.Hour // large so only idle is exercised here
+	cfg.Lifetime.StoppedTTL = 24 * time.Hour
+	m := manager.New(cfg, session.NewMemoryStore(), &fakeRuntime{}, nil, nil)
+	r := New(m)
+
+	atTTL := &session.Session{State: session.StateRunning, CreatedAt: now.Add(-time.Hour), LastActivityAt: now.Add(-time.Hour)}
+	if _, expired := r.runningExpired(atTTL, now); expired {
+		t.Fatal("running session at exactly the idle TTL should not be expired")
 	}
-	if !runningExpired(&session.Session{State: session.StateRunning, LastActivityAt: now.Add(-time.Hour - time.Nanosecond)}, now, time.Hour) {
-		t.Fatal("running session older than the TTL should be expired")
+	pastTTL := &session.Session{State: session.StateRunning, CreatedAt: now.Add(-time.Hour), LastActivityAt: now.Add(-time.Hour - time.Nanosecond)}
+	if _, expired := r.runningExpired(pastTTL, now); !expired {
+		t.Fatal("running session idle longer than the TTL should be expired")
 	}
 	if stoppedExpired(&session.Session{State: session.StateStopped, StoppedAt: now.Add(-24 * time.Hour)}, now, 24*time.Hour) {
 		t.Fatal("stopped session at exactly the TTL should not be expired")
@@ -129,6 +146,37 @@ func TestExpirationHelpersRequireStrictlyOlderThanTTL(t *testing.T) {
 	if !stoppedExpired(&session.Session{State: session.StateStopped, StoppedAt: now.Add(-24*time.Hour - time.Nanosecond)}, now, 24*time.Hour) {
 		t.Fatal("stopped session older than the TTL should be expired")
 	}
+}
+
+func TestRunningExpiredMaxLifetimeAndActiveCalls(t *testing.T) {
+	now := time.Date(2026, 7, 8, 20, 0, 0, 0, time.UTC)
+
+	cfg := config.Default()
+	cfg.Lifetime.RunningTTL = 10 * time.Minute
+	cfg.Lifetime.MaxLifetime = time.Hour
+	m := manager.New(cfg, session.NewMemoryStore(), &fakeRuntime{}, nil, nil)
+	r := New(m)
+
+	// Idle past the idle TTL with no active call -> expired (idle).
+	idle := &session.Session{ID: "s-idle", State: session.StateRunning, CreatedAt: now.Add(-20 * time.Minute), LastActivityAt: now.Add(-11 * time.Minute)}
+	if reason, expired := r.runningExpired(idle, now); !expired || reason != "idle" {
+		t.Fatalf("idle session: got reason=%q expired=%v, want idle/true", reason, expired)
+	}
+
+	// Same idle session but with an in-flight MCP call -> NOT expired.
+	m.BeginActivity(context.Background(), "s-idle")
+	if _, expired := r.runningExpired(idle, now); expired {
+		t.Fatal("session with an active MCP call should not be idle-expired")
+	}
+	m.EndActivity(context.Background(), "s-idle")
+
+	// Exceeds max lifetime -> expired even with an active call.
+	old := &session.Session{ID: "s-old", State: session.StateRunning, CreatedAt: now.Add(-2 * time.Hour), LastActivityAt: now}
+	m.BeginActivity(context.Background(), "s-old")
+	if reason, expired := r.runningExpired(old, now); !expired || reason != "max-lifetime" {
+		t.Fatalf("over-max-lifetime session: got reason=%q expired=%v, want max-lifetime/true", reason, expired)
+	}
+	m.EndActivity(context.Background(), "s-old")
 }
 
 func seedSessions(t *testing.T, ctx context.Context, store session.Store, sessions []*session.Session) {

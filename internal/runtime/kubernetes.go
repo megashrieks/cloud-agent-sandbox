@@ -17,6 +17,7 @@ import (
 const (
 	sandboxAppLabel     = "sandbox"
 	sessionLabel        = "sandbox/session"
+	poolLabel           = "sandbox/pool"
 	workspaceVolumeName = "workspace"
 	caVolumeName        = "sandbox-ca"
 	caSecretKey         = "ca.crt"
@@ -92,6 +93,15 @@ func (r *KubeRuntime) WaitReady(ctx context.Context, podName string, timeout tim
 		if err == nil && handle.Ready {
 			return nil
 		}
+		// Fail fast on an unrecoverable image pull error instead of blocking
+		// until the ready deadline. This surfaces a clear message when a caller
+		// passes a bad image (e.g. a non-existent ref) rather than a generic
+		// "context deadline exceeded".
+		if err == nil {
+			if reason, msg, bad := r.imagePullError(waitCtx, podName); bad {
+				return fmt.Errorf("sandbox image cannot be pulled (%s): %s", reason, msg)
+			}
+		}
 
 		select {
 		case <-waitCtx.Done():
@@ -102,6 +112,26 @@ func (r *KubeRuntime) WaitReady(ctx context.Context, podName string, timeout tim
 		case <-ticker.C:
 		}
 	}
+}
+
+// imagePullError reports whether the pod's sandbox container is stuck on an
+// unrecoverable image pull (ErrImagePull / ImagePullBackOff) and returns the
+// waiting reason and message for a clear error.
+func (r *KubeRuntime) imagePullError(ctx context.Context, podName string) (reason, message string, bad bool) {
+	pod, err := r.cs.CoreV1().Pods(r.namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		return "", "", false
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		w := cs.State.Waiting
+		if w == nil {
+			continue
+		}
+		if w.Reason == "ImagePullBackOff" || w.Reason == "ErrImagePull" {
+			return w.Reason, w.Message, true
+		}
+	}
+	return "", "", false
 }
 
 func (r *KubeRuntime) Stop(ctx context.Context, podName string) error {
@@ -167,6 +197,54 @@ func (r *KubeRuntime) Get(ctx context.Context, podName string) (*SandboxHandle, 
 	return handleFromPod(pod), nil
 }
 
+// ListSandboxes returns all sandbox pods (label app=sandbox), excluding those
+// already being deleted.
+func (r *KubeRuntime) ListSandboxes(ctx context.Context) ([]SandboxRef, error) {
+	pods, err := r.cs.CoreV1().Pods(r.namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + sandboxAppLabel})
+	if err != nil {
+		return nil, fmt.Errorf("list sandbox pods: %w", err)
+	}
+	refs := make([]SandboxRef, 0, len(pods.Items))
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp != nil {
+			continue
+		}
+		sid := p.Labels[sessionLabel]
+		refs = append(refs, SandboxRef{
+			PodName:   p.Name,
+			PVCName:   pvcName(sid),
+			SessionID: sid,
+			Pool:      p.Labels[poolLabel] != "",
+			CreatedAt: p.CreationTimestamp.Time,
+		})
+	}
+	return refs, nil
+}
+
+// ListWorkspaces returns all sandbox workspace PVCs (label app=sandbox).
+func (r *KubeRuntime) ListWorkspaces(ctx context.Context) ([]WorkspaceRef, error) {
+	pvcs, err := r.cs.CoreV1().PersistentVolumeClaims(r.namespace).List(ctx, metav1.ListOptions{LabelSelector: "app=" + sandboxAppLabel})
+	if err != nil {
+		return nil, fmt.Errorf("list sandbox pvcs: %w", err)
+	}
+	refs := make([]WorkspaceRef, 0, len(pvcs.Items))
+	for i := range pvcs.Items {
+		pvc := &pvcs.Items[i]
+		if pvc.DeletionTimestamp != nil {
+			continue
+		}
+		refs = append(refs, WorkspaceRef{
+			PVCName:   pvc.Name,
+			PodName:   podName(pvc.Labels[sessionLabel]),
+			SessionID: pvc.Labels[sessionLabel],
+			Pool:      pvc.Labels[poolLabel] != "",
+			CreatedAt: pvc.CreationTimestamp.Time,
+		})
+	}
+	return refs, nil
+}
+
 func (r *KubeRuntime) buildPod(spec SandboxSpec, pvcName string) *corev1.Pod {
 	labels := r.labels(spec)
 	runAsNonRoot := true
@@ -174,6 +252,17 @@ func (r *KubeRuntime) buildPod(spec SandboxSpec, pvcName string) *corev1.Pod {
 	privileged := false
 	readOnlyRootFilesystem := true
 	runAsUser := r.sc.RunAsUser
+	// Installable dev sandbox: run as root and/or with a writable root fs so an
+	// arbitrary user-chosen image can install system packages (apk/apt/dnf) into
+	// itself. Containment still comes from the runtime class, dropped caps,
+	// seccomp, no SA token, and the egress NetworkPolicy.
+	if spec.RunAsRoot {
+		runAsNonRoot = false
+		runAsUser = 0
+	}
+	if spec.WritableRoot {
+		readOnlyRootFilesystem = false
+	}
 	runtimeClass := spec.RuntimeClass
 	if runtimeClass == "" {
 		runtimeClass = r.sc.RuntimeClass
@@ -189,7 +278,9 @@ func (r *KubeRuntime) buildPod(spec SandboxSpec, pvcName string) *corev1.Pod {
 		{
 			Name: "tmp",
 			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
+				EmptyDir: &corev1.EmptyDirVolumeSource{
+					SizeLimit: quantityPtrOrNil(r.sc.TmpSizeLimit),
+				},
 			},
 		},
 	}
@@ -220,7 +311,8 @@ func (r *KubeRuntime) buildPod(spec SandboxSpec, pvcName string) *corev1.Pod {
 		VolumeMounts:    mounts,
 		Env:             append(proxyEnv(spec.ProxyEndpoint), caTrustEnv(len(spec.CACert) > 0, r.sc.CACertPath)...),
 		Resources: corev1.ResourceRequirements{
-			Limits: resourceList(r.sc.CPULimit, r.sc.MemoryLimit),
+			Limits:   resourceList(r.sc.CPULimit, r.sc.MemoryLimit, r.sc.EphemeralStorageLimit),
+			Requests: resourceList(r.sc.CPURequest, r.sc.MemoryRequest, r.sc.EphemeralStorageRequest),
 		},
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: &allowPrivilegeEscalation,
@@ -248,7 +340,7 @@ func (r *KubeRuntime) buildPod(spec SandboxSpec, pvcName string) *corev1.Pod {
 				RunAsUser:      &runAsUser,
 				RunAsGroup:     &runAsUser,
 				FSGroup:        &runAsUser,
-				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				SeccompProfile: seccompProfile(r.sc.SeccompProfilePath),
 			},
 			Volumes:    volumes,
 			Containers: []corev1.Container{container},
@@ -318,15 +410,40 @@ func firstPVCName(pod *corev1.Pod) string {
 	return ""
 }
 
-func resourceList(cpu, memory string) corev1.ResourceList {
-	limits := corev1.ResourceList{}
+func resourceList(cpu, memory, ephemeralStorage string) corev1.ResourceList {
+	list := corev1.ResourceList{}
 	if cpu != "" {
-		limits[corev1.ResourceCPU] = resource.MustParse(cpu)
+		list[corev1.ResourceCPU] = resource.MustParse(cpu)
 	}
 	if memory != "" {
-		limits[corev1.ResourceMemory] = resource.MustParse(memory)
+		list[corev1.ResourceMemory] = resource.MustParse(memory)
 	}
-	return limits
+	if ephemeralStorage != "" {
+		list[corev1.ResourceEphemeralStorage] = resource.MustParse(ephemeralStorage)
+	}
+	return list
+}
+
+// quantityPtrOrNil parses a resource quantity string, returning nil for empty
+// input (so an unset limit stays unset rather than becoming zero).
+func quantityPtrOrNil(value string) *resource.Quantity {
+	if value == "" {
+		return nil
+	}
+	q := resource.MustParse(value)
+	return &q
+}
+
+// seccompProfile selects a Localhost profile when a path is configured (used to
+// ship a hardened profile that also blocks io_uring), otherwise RuntimeDefault.
+func seccompProfile(localhostPath string) *corev1.SeccompProfile {
+	if localhostPath != "" {
+		return &corev1.SeccompProfile{
+			Type:             corev1.SeccompProfileTypeLocalhost,
+			LocalhostProfile: &localhostPath,
+		}
+	}
+	return &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
 }
 
 func proxyEnv(endpoint string) []corev1.EnvVar {
@@ -340,6 +457,14 @@ func proxyEnv(endpoint string) []corev1.EnvVar {
 		{Name: "https_proxy", Value: proxy},
 		{Name: "http_proxy", Value: proxy},
 		{Name: "NO_PROXY", Value: "localhost,127.0.0.1"},
+		// Placeholder token so the `gh` CLI operates through the proxy. gh
+		// refuses to send API requests (and reports "not logged in") unless it
+		// finds a token in its own env, so we give it a non-secret placeholder.
+		// The proxy STRIPS this client Authorization header and injects the real
+		// credential for api.github.com, so the sandbox never sees a real token
+		// yet `gh auth status`/`gh pr create` work. Only set when egress is
+		// forced through the proxy (endpoint != "").
+		{Name: "GH_TOKEN", Value: "sandbox-proxy-injected"},
 	}
 }
 

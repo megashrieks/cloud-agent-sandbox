@@ -89,7 +89,7 @@ Point any MCP client at the streamable-HTTP endpoint `http://localhost:8080/mcp`
 
 1. `create_session` → returns `session_id`.
 2. `shell` `{session_id, command: "git clone https://github.com/<org>/<repo> /workspace/repo"}`
-  , the clone succeeds with credentials the sandbox never sees (injected by the proxy).
+   The clone succeeds with credentials the sandbox never sees (injected by the proxy).
 3. `read_file` / `str_replace` / `write_file` to make changes.
 4. `shell` `{command: "cd /workspace/repo && git checkout -b change && git commit -am wip && git push -u origin change"}`.
 
@@ -104,8 +104,8 @@ kind delete cluster --name sandbox-dev
 
 ## Troubleshooting
 
-- **mitmproxy pod stuck ContainerCreating**, the `mitmproxy-ca` secret doesn't exist yet. Ensure
+- **mitmproxy pod stuck ContainerCreating**: the `mitmproxy-ca` secret doesn't exist yet. Ensure
   the orchestrator started successfully (it provisions it).
-- **git clone fails with TLS errors**, the CA wasn't injected; confirm `SANDBOX_*` proxy env and
+- **git clone fails with TLS errors**: the CA wasn't injected; confirm `SANDBOX_*` proxy env and
   `/tmp/ca-bundle.crt` exist in the sandbox (`shell` `{command:"env | grep -i ca"}`).
-- **egress not blocked**, your CNI isn't enforcing NetworkPolicy; install Calico/Cilium.
+- **egress not blocked**: your CNI isn't enforcing NetworkPolicy; install Calico/Cilium.

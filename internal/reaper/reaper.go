@@ -14,6 +14,7 @@ import (
 type Reaper struct {
 	m            *manager.Manager
 	runningTTL   time.Duration
+	maxLifetime  time.Duration
 	stoppedTTL   time.Duration
 	reapInterval time.Duration
 	now          func() time.Time
@@ -25,6 +26,7 @@ func New(m *manager.Manager) *Reaper {
 	return &Reaper{
 		m:            m,
 		runningTTL:   lifetime.RunningTTL,
+		maxLifetime:  lifetime.MaxLifetime,
 		stoppedTTL:   lifetime.StoppedTTL,
 		reapInterval: lifetime.ReapInterval,
 		now:          time.Now,
@@ -54,19 +56,27 @@ func (r *Reaper) Run(ctx context.Context) {
 func (r *Reaper) reapOnce(ctx context.Context) {
 	now := r.now()
 
+	// Reconcile platform-level orphans first: pods/PVCs that outlived the
+	// in-memory session store (e.g. created before an orchestrator restart) and
+	// are therefore invisible to the store-driven passes below.
+	r.m.SweepOrphans(ctx)
+
 	running, err := r.m.Store().ListByState(ctx, session.StateRunning)
 	if err != nil {
 		slog.Error("list running sessions for reaping", "error", err)
 	} else {
 		for _, s := range running {
-			if !runningExpired(s, now, r.runningTTL) {
+			reason, expired := r.runningExpired(s, now)
+			if !expired {
 				continue
 			}
 			if err := r.m.Stop(ctx, s.ID); err != nil {
 				slog.Error("stop expired running sandbox", "session_id", s.ID, "error", err)
 				continue
 			}
-			slog.Info("stopped expired running sandbox", "session_id", s.ID, "last_activity_at", s.LastActivityAt, "running_ttl", r.runningTTL)
+			slog.Info("stopped expired running sandbox", "session_id", s.ID, "reason", reason,
+				"last_activity_at", s.LastActivityAt, "created_at", s.CreatedAt,
+				"idle_ttl", r.runningTTL, "max_lifetime", r.maxLifetime)
 		}
 	}
 
@@ -87,8 +97,22 @@ func (r *Reaper) reapOnce(ctx context.Context) {
 	}
 }
 
-func runningExpired(s *session.Session, now time.Time, ttl time.Duration) bool {
-	return s != nil && s.State == session.StateRunning && now.Sub(s.LastActivityAt) > ttl
+// runningExpired decides whether a running sandbox should be stopped. It
+// returns a human-readable reason and true when either the hard max-lifetime
+// cap is exceeded, or the sandbox has been idle past runningTTL with no
+// in-flight MCP call. An active MCP call suppresses the idle timeout but never
+// the max-lifetime cap.
+func (r *Reaper) runningExpired(s *session.Session, now time.Time) (string, bool) {
+	if s == nil || s.State != session.StateRunning {
+		return "", false
+	}
+	if r.maxLifetime > 0 && now.Sub(s.CreatedAt) > r.maxLifetime {
+		return "max-lifetime", true
+	}
+	if now.Sub(s.LastActivityAt) > r.runningTTL && !r.m.HasActiveCalls(s.ID) {
+		return "idle", true
+	}
+	return "", false
 }
 
 func stoppedExpired(s *session.Session, now time.Time, ttl time.Duration) bool {

@@ -4,8 +4,16 @@ metadata:
   name: sandboxes
   labels:
     app.kubernetes.io/part-of: sandbox-orchestrator
-    # PodSecurity: enforce the "restricted" standard on the sandbox namespace.
-    pod-security.kubernetes.io/enforce: restricted
+    # PodSecurity: enforce the "baseline" standard on the sandbox namespace.
+    # Sandboxes run as root with a writable root filesystem so an arbitrary
+    # user-chosen image can install system packages into itself; "restricted"
+    # forbids runAsUser=0 / runAsNonRoot=false and would reject them. "baseline"
+    # still blocks the dangerous host-breakout surface (privileged, hostPath,
+    # host namespaces/ports, added capabilities), and real isolation comes from
+    # the runtime class (gVisor/Kata), dropped caps, seccomp, no SA token, and
+    # the egress-only NetworkPolicy. The orchestrator/mitmproxy control-plane
+    # pods still satisfy "restricted" (a stricter superset) unaffected.
+    pod-security.kubernetes.io/enforce: baseline
     pod-security.kubernetes.io/enforce-version: latest
-    pod-security.kubernetes.io/audit: restricted
-    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline

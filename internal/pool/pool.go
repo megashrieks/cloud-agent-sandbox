@@ -139,6 +139,8 @@ func (p *WarmPool) createOne(ctx context.Context) error {
 		RuntimeClass:  p.cfg.Sandbox.RuntimeClass,
 		ProxyEndpoint: p.proxyEndpoint,
 		CACert:        append([]byte(nil), p.caCert...),
+		RunAsRoot:     p.cfg.Sandbox.RunAsRoot,
+		WritableRoot:  p.cfg.Sandbox.WritableRootFilesystem,
 		Labels: map[string]string{
 			poolIdleLabel: "idle",
 		},

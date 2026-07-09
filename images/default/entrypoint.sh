@@ -7,6 +7,14 @@ COMBINED_CA_BUNDLE="/tmp/ca-bundle.crt"
 RUNTIME_HOME="${HOME:-/tmp/sandbox-home}"
 
 mkdir -p "$RUNTIME_HOME" 2>/dev/null || true
+# Pre-create the writable toolchain cache/home dirs. The root FS is read-only, so
+# every language cache is redirected under /tmp (see the image Dockerfile ENV).
+# Creating them up front avoids first-run failures on some tools.
+for d in "${GOPATH:-}" "${GOCACHE:-}" "${GOMODCACHE:-}" "${CARGO_HOME:-}" \
+         "${GRADLE_USER_HOME:-}" "${DOTNET_CLI_HOME:-}" "${NUGET_PACKAGES:-}" \
+         "${PIP_CACHE_DIR:-}" "${npm_config_cache:-}"; do
+    [ -n "$d" ] && mkdir -p "$d" 2>/dev/null || true
+done
 
 # The pod spec should point common TLS clients at COMBINED_CA_BUNDLE with:
 # NODE_EXTRA_CA_CERTS, REQUESTS_CA_BUNDLE, SSL_CERT_FILE, GIT_SSL_CAINFO, CURL_CA_BUNDLE.

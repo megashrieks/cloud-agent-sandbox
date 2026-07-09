@@ -65,6 +65,11 @@ type CreateOptions struct {
 	ProxyGroup string
 	// UseKata requests the stronger (Kata) isolation runtime class.
 	UseKata bool
+	// WritableRoot / RunAsRoot override the configured defaults for this
+	// session. nil means "use the orchestrator's configured default". Set them
+	// to allow (or forbid) system package installs in the chosen image.
+	WritableRoot *bool
+	RunAsRoot    *bool
 }
 
 // Store persists and retrieves sessions. Implementations must be safe for

@@ -12,7 +12,10 @@ metadata:
   labels:
     app: mitmproxy
 spec:
-  replicas: 2
+  # replicas is managed by the orchestrator's proxy autoscaler (~1 per
+  # SANDBOX_SANDBOXES_PER_PROXY sandboxes; scales to zero when idle). The value
+  # here is only the initial count before the orchestrator reconciles.
+  replicas: 0
   selector:
     matchLabels:
       app: mitmproxy

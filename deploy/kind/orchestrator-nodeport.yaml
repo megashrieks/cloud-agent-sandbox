@@ -1,0 +1,20 @@
+# Local-only NodePort so the orchestrator REST + MCP endpoint is reachable from
+# the host at http://localhost:30080 (kind-config maps hostPort 30080).
+# Production uses the ClusterIP Service in deploy/k8s/50-orchestrator.yaml behind
+# an ingress/gateway instead.
+apiVersion: v1
+kind: Service
+metadata:
+  name: orchestrator-nodeport
+  namespace: sandboxes
+  labels:
+    app: orchestrator
+spec:
+  type: NodePort
+  selector:
+    app: orchestrator
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
+      protocol: TCP

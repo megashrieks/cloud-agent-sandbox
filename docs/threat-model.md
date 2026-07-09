@@ -22,21 +22,21 @@ allowed to compromise the trusted side or reveal a credential.**
 
 Applied to every sandbox pod (`internal/runtime/kubernetes.go`):
 
-- **Isolation runtime via RuntimeClass**, `gvisor` (default) or `kata` (opt-in). gVisor runs a
+- **Isolation runtime via RuntimeClass**: `gvisor` (default) or `kata` (opt-in). gVisor runs a
   user-space kernel so untrusted syscalls do not hit the host kernel directly; Kata gives each
   sandbox its own VM kernel. Configured by `SANDBOX_RUNTIME_CLASS`.
-- **Non-root**, `runAsNonRoot: true`, `runAsUser: 1000`; no root inside the container.
-- **No privilege escalation**, `allowPrivilegeEscalation: false`, `privileged: false`,
+- **Non-root**: `runAsNonRoot: true`, `runAsUser: 1000`; no root inside the container.
+- **No privilege escalation**: `allowPrivilegeEscalation: false`, `privileged: false`,
   `no-new-privileges` via the restricted PodSecurity standard.
-- **Drop ALL capabilities**, `capabilities.drop: ["ALL"]`.
-- **Read-only root filesystem**, only `/tmp` (emptyDir) and `/workspace` (PVC) are writable.
-- **Seccomp**, `RuntimeDefault` profile.
-- **No service-account token**, `automountServiceAccountToken: false`, so the sandbox has no
+- **Drop ALL capabilities**: `capabilities.drop: ["ALL"]`.
+- **Read-only root filesystem**: only `/tmp` (emptyDir) and `/workspace` (PVC) are writable.
+- **Seccomp**: `RuntimeDefault` profile.
+- **No service-account token**: `automountServiceAccountToken: false`, so the sandbox has no
   Kubernetes API credentials.
-- **Resource limits**, CPU/memory limits bound denial-of-service.
-- **No docker socket**, the sandbox has no access to any container runtime socket, so it cannot
+- **Resource limits**: CPU/memory limits bound denial-of-service.
+- **No docker socket**: the sandbox has no access to any container runtime socket, so it cannot
   spawn privileged containers.
-- **PodSecurity**, the `sandboxes` namespace enforces the `restricted` Pod Security Standard.
+- **PodSecurity**: the `sandboxes` namespace enforces the `restricted` Pod Security Standard.
 
 ## 2. Network containment (exfiltration prevention)
 
@@ -46,10 +46,10 @@ labelled `app=sandbox`:
 - **Ingress: denied entirely.** Nothing can connect into a sandbox.
 - **Egress: denied except** DNS (to kube-dns) and TCP to the `app=mitmproxy` pool on 8080.
 - The sandbox therefore cannot reach the internet, the cluster API, cloud metadata endpoints,
-  or other pods directly, only the proxy.
+  or other pods directly. Only the proxy is reachable.
 
 > Requires a NetworkPolicy-enforcing CNI (Calico/Cilium). kind's default kindnet does **not**
-> enforce policy, see `docs/local-dev.md`.
+> enforce policy. See `docs/local-dev.md`.
 
 ## 3. Credential isolation
 
@@ -76,7 +76,7 @@ replica behind the Service and still trust it. The orchestrator provisions this 
   push to an attacker-controlled repo) is a data path. The allowlist + the user's choice of
   injected scopes are the real boundary. Keep tokens least-privilege.
 - **gVisor/Kata availability:** on clusters without these runtimes, set `SANDBOX_RUNTIME_CLASS=""`
-  to fall back to the hardened baseline only, weaker isolation; do not run truly hostile code
-  there.
+  to fall back to the hardened baseline only, which is weaker isolation; do not run truly hostile
+  code there.
 - **Multi-tenant auth** for the MCP/REST surface (who may create/reach which session) is a layer
   to add on top; today any caller of the orchestrator can address any session.

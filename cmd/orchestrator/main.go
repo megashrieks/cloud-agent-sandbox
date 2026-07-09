@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/megashrieks/sandbox-orchestrator/internal/kube"
 	"github.com/megashrieks/sandbox-orchestrator/internal/manager"
 	mcpserver "github.com/megashrieks/sandbox-orchestrator/internal/mcp"
+	"github.com/megashrieks/sandbox-orchestrator/internal/netpolicy"
 	"github.com/megashrieks/sandbox-orchestrator/internal/pool"
 	"github.com/megashrieks/sandbox-orchestrator/internal/proxy"
 	"github.com/megashrieks/sandbox-orchestrator/internal/reaper"
@@ -53,6 +55,25 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	// Fail-closed guard: confirm the cluster will actually ENFORCE the sandbox
+	// egress NetworkPolicy before we ever schedule untrusted code. A policy that
+	// is present but unenforced (no policy-capable CNI) silently leaks egress.
+	npRes, npErr := netpolicy.Verify(ctx, kc.Clientset, netpolicy.Options{
+		Namespace:        cfg.Kube.Namespace,
+		EnforcedOverride: cfg.Security.NetworkPolicyEnforced,
+	})
+	if npErr != nil {
+		if cfg.Security.RequireNetworkPolicy {
+			return fmt.Errorf("refusing to start (sandbox egress containment unverified): %w; "+
+				"set SANDBOX_REQUIRE_NETWORK_POLICY=false to bypass at your own risk", npErr)
+		}
+		logger.Warn("network policy enforcement NOT confirmed; sandbox egress may be uncontained",
+			"reason", npRes.Reason)
+	} else {
+		logger.Info("network policy enforcement confirmed",
+			"policy", npRes.PolicyName, "enforcer", npRes.EnforcerName)
+	}
+
 	// Ensure the shared proxy CA exists before wiring the assigner (idempotent).
 	if err := proxy.EnsureCASecret(ctx, kc.Clientset, cfg.Kube.Namespace); err != nil {
 		logger.Warn("could not ensure proxy CA secret; proxy injection may be disabled", "err", err)
@@ -79,7 +100,19 @@ func run(logger *slog.Logger) error {
 	store := session.NewMemoryStore()
 	mgr := manager.New(cfg, store, rt, warmPool, proxyAssigner)
 
-	// Lifetime reaper (1h running / 24h stopped).
+	// Proxy autoscaler: ~1 mitmproxy per SandboxesPerProxy active sandbox pods,
+	// scale-to-zero when idle, on-demand scale-up before a sandbox starts.
+	if cfg.Proxy.Autoscale && proxyAssigner != nil {
+		as := proxy.NewAutoscaler(kc.Clientset, cfg.Proxy, cfg.Kube.Namespace)
+		mgr.SetProxyScaler(as)
+		go as.Run(ctx)
+		logger.Info("proxy autoscaler enabled",
+			"sandboxes_per_proxy", cfg.Proxy.SandboxesPerProxy,
+			"min_replicas", cfg.Proxy.MinReplicas,
+			"max_replicas", cfg.Proxy.MaxReplicas)
+	}
+
+	// Lifetime reaper (idle + max-lifetime running / stopped purge).
 	rp := reaper.New(mgr)
 	go rp.Run(ctx)
 

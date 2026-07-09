@@ -31,3 +31,6 @@ Thumbs.db
 *.key
 *.crt
 !deploy/**/*.crt
+
+# Internal working notes (not published)
+/docs/rundown.md

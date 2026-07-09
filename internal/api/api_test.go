@@ -43,6 +43,14 @@ func (fakeRuntime) Get(ctx context.Context, podName string) (*runtime.SandboxHan
 	return &runtime.SandboxHandle{PodName: podName, Phase: "Running", Ready: true}, nil
 }
 
+func (fakeRuntime) ListSandboxes(ctx context.Context) ([]runtime.SandboxRef, error) {
+	return nil, nil
+}
+
+func (fakeRuntime) ListWorkspaces(ctx context.Context) ([]runtime.WorkspaceRef, error) {
+	return nil, nil
+}
+
 func TestSessionLifecycleRoutes(t *testing.T) {
 	cfg := config.Default()
 	cfg.Pool.MaxRunning = 5

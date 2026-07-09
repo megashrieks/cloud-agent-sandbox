@@ -41,8 +41,10 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) registerTools(srv *mcpserver.MCPServer) {
 	srv.AddTool(mcplib.NewTool("create_session",
 		mcplib.WithDescription("Create one new sandbox session. Use first; other tools require the returned session_id."),
-		mcplib.WithString("image", mcplib.Description("Optional container image override.")),
+		mcplib.WithString("image", mcplib.Description("Optional container image. Omit or use \"default\" for the standard polyglot sandbox image. Otherwise pass any fully-qualified image reference the cluster can pull (e.g. alpine:3.20, python:3.12, node:22, ubuntu:24.04). By default the sandbox runs as root with a writable root filesystem so you can install packages inside it (apk add / apt-get install / pip install), and all outbound network works via the credential-injecting proxy.")),
 		mcplib.WithBoolean("use_kata", mcplib.Description("Request stronger Kata isolation when available.")),
+		mcplib.WithBoolean("writable_root", mcplib.Description("Optional. Default true. Whether the container root filesystem is writable so system package managers can install. Set false to harden (read-only root; /workspace and /tmp stay writable).")),
+		mcplib.WithBoolean("run_as_root", mcplib.Description("Optional. Default true. Whether the sandbox process runs as root (UID 0) so it can install system packages. Set false to run as an unprivileged user.")),
 	), s.createSession)
 
 	srv.AddTool(mcplib.NewTool("shell",
@@ -72,43 +74,125 @@ func (s *Server) registerTools(srv *mcpserver.MCPServer) {
 		mcplib.WithString("job_id", mcplib.Description("Optional job id to stop.")),
 	), s.shellStop)
 
-	srv.AddTool(mcplib.NewTool("read_file",
-		mcplib.WithDescription("Read a sandbox file and return 1-indexed numbered lines, optionally sliced by line range."),
+	srv.AddTool(mcplib.NewTool("shell_wait",
+		mcplib.WithDescription("Block until an async shell job finishes (or the timeout elapses) and return its final status plus full accumulated output. Use after shell_async when you just want the result and don't need to poll manually."),
 		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
-		mcplib.WithString("path", mcplib.Required(), mcplib.Description("File path inside the sandbox.")),
-		mcplib.WithNumber("start_line", mcplib.Description("Optional first line to include, 1-indexed.")),
-		mcplib.WithNumber("end_line", mcplib.Description("Optional last line to include, inclusive.")),
-	), s.readFile)
+		mcplib.WithString("job_id", mcplib.Required(), mcplib.Description("Job id returned by shell_async.")),
+		mcplib.WithNumber("timeout_seconds", mcplib.Description("Optional max seconds to wait. If the job is still running when this elapses, returns the current (running) status and output so far. Omit or <=0 to wait indefinitely (up to the request deadline).")),
+		mcplib.WithNumber("poll_interval_seconds", mcplib.Description("Optional seconds between internal status checks. Default 1.")),
+	), s.shellWait)
 
-	srv.AddTool(mcplib.NewTool("write_file",
-		mcplib.WithDescription("Create or overwrite a sandbox file with exact content."),
+	srv.AddTool(mcplib.NewTool("str_replace_based_edit_tool",
+		mcplib.WithDescription("File editor for a sandbox. Choose the operation with the `command` field: `view` prints a file with 1-indexed line numbers, optionally sliced by `view_range`; `create` writes (or overwrites) a file with `file_text`; `str_replace` replaces a unique `old_str` with `new_str`; `insert` adds `new_str` after line `insert_line` (0 = start of file)."),
 		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
-		mcplib.WithString("path", mcplib.Required(), mcplib.Description("File path inside the sandbox.")),
-		mcplib.WithString("content", mcplib.Required(), mcplib.Description("Exact file content to write.")),
-	), s.writeFile)
+		mcplib.WithString("command", mcplib.Required(), mcplib.Enum("view", "create", "str_replace", "insert"), mcplib.Description("The edit operation to perform: view | create | str_replace | insert.")),
+		mcplib.WithString("path", mcplib.Required(), mcplib.Description("Absolute file path inside the sandbox (e.g. /workspace/app/main.py).")),
+		mcplib.WithArray("view_range", mcplib.Description("Optional for `view`: [start_line, end_line], both 1-indexed. Use -1 as end_line to read to end of file."), mcplib.Items(map[string]any{"type": "integer"})),
+		mcplib.WithString("file_text", mcplib.Description("Required for `create`: the exact, full content of the file to write.")),
+		mcplib.WithString("old_str", mcplib.Description("Required for `str_replace`: the existing text to replace. Must occur exactly once in the file.")),
+		mcplib.WithString("new_str", mcplib.Description("The replacement text for `str_replace`, or the text to add for `insert`.")),
+		mcplib.WithNumber("insert_line", mcplib.Description("Required for `insert`: the 1-indexed line number after which to insert new_str; 0 inserts at the start of the file.")),
+	), s.editTool)
+}
 
-	srv.AddTool(mcplib.NewTool("str_replace",
-		mcplib.WithDescription("Replace old_str with new_str in a file only when old_str occurs exactly once."),
-		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
-		mcplib.WithString("path", mcplib.Required(), mcplib.Description("File path inside the sandbox.")),
-		mcplib.WithString("old_str", mcplib.Required(), mcplib.Description("Existing text that must match exactly once.")),
-		mcplib.WithString("new_str", mcplib.Required(), mcplib.Description("Replacement text.")),
-	), s.strReplace)
+func (s *Server) editTool(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	sess, done, fail := s.requireSession(ctx, req)
+	if fail != nil {
+		return fail, nil
+	}
+	defer done()
+	command, err := req.RequireString("command")
+	if err != nil {
+		return mcplib.NewToolResultError(err.Error()), nil
+	}
+	path, err := req.RequireString("path")
+	if err != nil {
+		return mcplib.NewToolResultError(err.Error()), nil
+	}
 
-	srv.AddTool(mcplib.NewTool("insert",
-		mcplib.WithDescription("Insert text after a 1-indexed line in a file; line 0 prepends."),
-		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
-		mcplib.WithString("path", mcplib.Required(), mcplib.Description("File path inside the sandbox.")),
-		mcplib.WithNumber("line", mcplib.Required(), mcplib.Description("Line after which to insert; 0 prepends.")),
-		mcplib.WithString("text", mcplib.Required(), mcplib.Description("Exact text to insert.")),
-	), s.insert)
+	switch command {
+	case "view":
+		content, rerr := s.ex.ReadFile(ctx, sess.PodName, path)
+		if rerr != nil {
+			return mcplib.NewToolResultError(fmt.Sprintf("view: %v", rerr)), nil
+		}
+		start, end := viewRangeFromRequest(req)
+		return mcplib.NewToolResultText(renderNumberedLines(string(content), start, end)), nil
+
+	case "create":
+		fileText, ferr := req.RequireString("file_text")
+		if ferr != nil {
+			return mcplib.NewToolResultError("create requires file_text"), nil
+		}
+		if werr := s.ex.WriteFile(ctx, sess.PodName, path, []byte(fileText)); werr != nil {
+			return mcplib.NewToolResultError(fmt.Sprintf("create: %v", werr)), nil
+		}
+		return mcplib.NewToolResultText(fmt.Sprintf("wrote %d bytes to %s", len(fileText), path)), nil
+
+	case "str_replace":
+		oldStr, oerr := req.RequireString("old_str")
+		if oerr != nil {
+			return mcplib.NewToolResultError("str_replace requires old_str"), nil
+		}
+		newStr := req.GetString("new_str", "")
+		content, rerr := s.ex.ReadFile(ctx, sess.PodName, path)
+		if rerr != nil {
+			return mcplib.NewToolResultError(fmt.Sprintf("str_replace read: %v", rerr)), nil
+		}
+		replaced, rperr := replaceUnique(string(content), oldStr, newStr)
+		if rperr != nil {
+			return mcplib.NewToolResultError(rperr.Error()), nil
+		}
+		if werr := s.ex.WriteFile(ctx, sess.PodName, path, []byte(replaced)); werr != nil {
+			return mcplib.NewToolResultError(fmt.Sprintf("str_replace write: %v", werr)), nil
+		}
+		return mcplib.NewToolResultText(fmt.Sprintf("replaced text in %s", path)), nil
+
+	case "insert":
+		line, lerr := req.RequireInt("insert_line")
+		if lerr != nil {
+			return mcplib.NewToolResultError("insert requires insert_line"), nil
+		}
+		newStr, nerr := req.RequireString("new_str")
+		if nerr != nil {
+			return mcplib.NewToolResultError("insert requires new_str"), nil
+		}
+		content, rerr := s.ex.ReadFile(ctx, sess.PodName, path)
+		if rerr != nil {
+			return mcplib.NewToolResultError(fmt.Sprintf("insert read: %v", rerr)), nil
+		}
+		inserted, ierr := insertAfterLine(string(content), line, newStr)
+		if ierr != nil {
+			return mcplib.NewToolResultError(ierr.Error()), nil
+		}
+		if werr := s.ex.WriteFile(ctx, sess.PodName, path, []byte(inserted)); werr != nil {
+			return mcplib.NewToolResultError(fmt.Sprintf("insert write: %v", werr)), nil
+		}
+		return mcplib.NewToolResultText(fmt.Sprintf("inserted %d bytes into %s", len(newStr), path)), nil
+
+	default:
+		return mcplib.NewToolResultError(fmt.Sprintf("unknown command %q (expected view|create|str_replace|insert)", command)), nil
+	}
 }
 
 func (s *Server) createSession(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 	image := req.GetString("image", "")
 	useKata := req.GetBool("use_kata", false)
 
-	sess, err := s.m.Create(ctx, session.CreateOptions{Image: image, UseKata: useKata})
+	opts := session.CreateOptions{Image: image, UseKata: useKata}
+	args := req.GetArguments()
+	if v, ok := args["writable_root"]; ok {
+		if b, ok := v.(bool); ok {
+			opts.WritableRoot = &b
+		}
+	}
+	if v, ok := args["run_as_root"]; ok {
+		if b, ok := v.(bool); ok {
+			opts.RunAsRoot = &b
+		}
+	}
+
+	sess, err := s.m.Create(ctx, opts)
 	if err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("create session: %v", err)), nil
 	}
@@ -116,10 +200,11 @@ func (s *Server) createSession(ctx context.Context, req mcplib.CallToolRequest) 
 }
 
 func (s *Server) shell(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	sess, fail := s.requireSession(ctx, req)
+	sess, done, fail := s.requireSession(ctx, req)
 	if fail != nil {
 		return fail, nil
 	}
+	defer done()
 	command, err := req.RequireString("command")
 	if err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
@@ -138,10 +223,11 @@ func (s *Server) shell(ctx context.Context, req mcplib.CallToolRequest) (*mcplib
 }
 
 func (s *Server) shellAsync(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	sess, fail := s.requireSession(ctx, req)
+	sess, done, fail := s.requireSession(ctx, req)
 	if fail != nil {
 		return fail, nil
 	}
+	defer done()
 	command, err := req.RequireString("command")
 	if err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
@@ -155,10 +241,11 @@ func (s *Server) shellAsync(ctx context.Context, req mcplib.CallToolRequest) (*m
 }
 
 func (s *Server) shellPoll(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	sess, fail := s.requireSession(ctx, req)
+	sess, done, fail := s.requireSession(ctx, req)
 	if fail != nil {
 		return fail, nil
 	}
+	defer done()
 	jobID, err := req.RequireString("job_id")
 	if err != nil {
 		return mcplib.NewToolResultError(err.Error()), nil
@@ -171,11 +258,63 @@ func (s *Server) shellPoll(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	return mcplib.NewToolResultText(formatJobPoll(job, output)), nil
 }
 
-func (s *Server) shellStop(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	sess, fail := s.requireSession(ctx, req)
+func (s *Server) shellWait(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	sess, done, fail := s.requireSession(ctx, req)
 	if fail != nil {
 		return fail, nil
 	}
+	defer done()
+	jobID, err := req.RequireString("job_id")
+	if err != nil {
+		return mcplib.NewToolResultError(err.Error()), nil
+	}
+
+	interval := time.Duration(req.GetFloat("poll_interval_seconds", 1) * float64(time.Second))
+	if interval <= 0 {
+		interval = time.Second
+	}
+	// Bound the wait: an explicit timeout, else the request's own deadline.
+	waitCtx := ctx
+	if timeout := timeoutFromRequest(req); timeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	var buf strings.Builder
+	var job *exec.Job
+	for {
+		j, out, perr := s.ex.PollJob(waitCtx, sess.PodName, jobID)
+		if perr != nil {
+			// Deadline/timeout hit while polling: return what we have so far.
+			if waitCtx.Err() != nil {
+				break
+			}
+			return mcplib.NewToolResultError(fmt.Sprintf("shell_wait: %v", perr)), nil
+		}
+		job = j
+		// PollJob returns the full accumulated log each call, so replace rather
+		// than append.
+		buf.Reset()
+		buf.WriteString(out)
+		if j != nil && !j.Running {
+			return mcplib.NewToolResultText(formatJobPoll(j, buf.String())), nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return mcplib.NewToolResultText(formatJobPoll(job, buf.String())), nil
+		case <-time.After(interval):
+		}
+	}
+	return mcplib.NewToolResultText(formatJobPoll(job, buf.String())), nil
+}
+
+func (s *Server) shellStop(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	sess, done, fail := s.requireSession(ctx, req)
+	if fail != nil {
+		return fail, nil
+	}
+	defer done()
 	jobID := req.GetString("job_id", "")
 	if err := s.ex.StopJob(ctx, sess.PodName, jobID); err != nil {
 		return mcplib.NewToolResultError(fmt.Sprintf("shell_stop: %v", err)), nil
@@ -186,124 +325,26 @@ func (s *Server) shellStop(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	return mcplib.NewToolResultText(fmt.Sprintf("stopped job_id: %s", jobID)), nil
 }
 
-func (s *Server) readFile(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	sess, fail := s.requireSession(ctx, req)
-	if fail != nil {
-		return fail, nil
-	}
-	path, err := req.RequireString("path")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-
-	content, err := s.ex.ReadFile(ctx, sess.PodName, path)
-	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("read_file: %v", err)), nil
-	}
-	start, end := lineRangeFromRequest(req)
-	return mcplib.NewToolResultText(renderNumberedLines(string(content), start, end)), nil
-}
-
-func (s *Server) writeFile(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	sess, fail := s.requireSession(ctx, req)
-	if fail != nil {
-		return fail, nil
-	}
-	path, err := req.RequireString("path")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-	content, err := req.RequireString("content")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-
-	if err := s.ex.WriteFile(ctx, sess.PodName, path, []byte(content)); err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("write_file: %v", err)), nil
-	}
-	return mcplib.NewToolResultText(fmt.Sprintf("wrote %d bytes to %s", len([]byte(content)), path)), nil
-}
-
-func (s *Server) strReplace(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	sess, fail := s.requireSession(ctx, req)
-	if fail != nil {
-		return fail, nil
-	}
-	path, err := req.RequireString("path")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-	oldStr, err := req.RequireString("old_str")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-	newStr, err := req.RequireString("new_str")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-
-	content, err := s.ex.ReadFile(ctx, sess.PodName, path)
-	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("str_replace read: %v", err)), nil
-	}
-	replaced, err := replaceUnique(string(content), oldStr, newStr)
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-	if err := s.ex.WriteFile(ctx, sess.PodName, path, []byte(replaced)); err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("str_replace write: %v", err)), nil
-	}
-	return mcplib.NewToolResultText(fmt.Sprintf("replaced text in %s", path)), nil
-}
-
-func (s *Server) insert(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	sess, fail := s.requireSession(ctx, req)
-	if fail != nil {
-		return fail, nil
-	}
-	path, err := req.RequireString("path")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-	line, err := req.RequireInt("line")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-	text, err := req.RequireString("text")
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-
-	content, err := s.ex.ReadFile(ctx, sess.PodName, path)
-	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("insert read: %v", err)), nil
-	}
-	inserted, err := insertAfterLine(string(content), line, text)
-	if err != nil {
-		return mcplib.NewToolResultError(err.Error()), nil
-	}
-	if err := s.ex.WriteFile(ctx, sess.PodName, path, []byte(inserted)); err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("insert write: %v", err)), nil
-	}
-	return mcplib.NewToolResultText(fmt.Sprintf("inserted %d bytes into %s", len([]byte(text)), path)), nil
-}
-
-func (s *Server) requireSession(ctx context.Context, req mcplib.CallToolRequest) (*session.Session, *mcplib.CallToolResult) {
+// requireSession validates the session id, marks an in-flight MCP call
+// (BeginActivity), and returns a cleanup func that MUST be deferred by the
+// caller to mark the call complete (EndActivity). On failure the returned
+// cleanup is a safe no-op.
+func (s *Server) requireSession(ctx context.Context, req mcplib.CallToolRequest) (*session.Session, func(), *mcplib.CallToolResult) {
+	noop := func() {}
 	sessionID, err := req.RequireString("session_id")
 	if err != nil {
-		return nil, mcplib.NewToolResultError(err.Error())
+		return nil, noop, mcplib.NewToolResultError(err.Error())
 	}
 	sess, err := s.m.Require(ctx, sessionID)
 	if err != nil {
 		if errors.Is(err, session.ErrInvalidSession) {
-			return nil, mcplib.NewToolResultError("invalid session")
+			return nil, noop, mcplib.NewToolResultError("invalid session")
 		}
-		return nil, mcplib.NewToolResultError(fmt.Sprintf("require session: %v", err))
+		return nil, noop, mcplib.NewToolResultError(fmt.Sprintf("require session: %v", err))
 	}
-	if err := s.m.Touch(ctx, sessionID); err != nil {
-		return nil, mcplib.NewToolResultError(fmt.Sprintf("touch session: %v", err))
-	}
-	return sess, nil
+	s.m.BeginActivity(ctx, sessionID)
+	cleanup := func() { s.m.EndActivity(context.WithoutCancel(ctx), sessionID) }
+	return sess, cleanup, nil
 }
 
 func timeoutFromRequest(req mcplib.CallToolRequest) time.Duration {
@@ -314,14 +355,39 @@ func timeoutFromRequest(req mcplib.CallToolRequest) time.Duration {
 	return time.Duration(seconds * float64(time.Second))
 }
 
-func lineRangeFromRequest(req mcplib.CallToolRequest) (int, int) {
-	args := req.GetArguments()
+// viewRangeFromRequest parses the optional `view_range` array ([start, end],
+// both 1-indexed; end -1 or 0 means "to end of file") for the `view` command.
+func viewRangeFromRequest(req mcplib.CallToolRequest) (int, int) {
 	start, end := 1, 0
-	if _, ok := args["start_line"]; ok {
-		start = req.GetInt("start_line", 1)
+	raw, ok := req.GetArguments()["view_range"]
+	if !ok {
+		return start, end
 	}
-	if _, ok := args["end_line"]; ok {
-		end = req.GetInt("end_line", 0)
+	arr, ok := raw.([]any)
+	if !ok || len(arr) == 0 {
+		return start, end
+	}
+	toInt := func(v any) (int, bool) {
+		switch n := v.(type) {
+		case float64:
+			return int(n), true
+		case int:
+			return n, true
+		case int64:
+			return int(n), true
+		}
+		return 0, false
+	}
+	if v, ok := toInt(arr[0]); ok {
+		start = v
+	}
+	if len(arr) > 1 {
+		if v, ok := toInt(arr[1]); ok {
+			end = v // -1/0 -> renderNumberedLines treats as end of file
+			if end < 0 {
+				end = 0
+			}
+		}
 	}
 	return start, end
 }

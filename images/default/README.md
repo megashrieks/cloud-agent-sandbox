@@ -4,19 +4,53 @@ This directory contains the curated default image for code sandboxes. It is inte
 
 ## Installed tools
 
-The image is based on `debian:stable-slim` and installs:
+The image is based on `debian:stable-slim` and installs a **polyglot** toolchain:
 
-- `git`
-- `gh` (GitHub CLI)
-- `curl`, `wget`
-- `ca-certificates`
-- `openssh-client`
-- `python3`, `python3-pip`
-- `nodejs` and `npm`
-- `build-essential`
+**Languages & runtimes**
+- **Python**: `python3`, `python3-pip`, `python3-venv`
+- **Node.js**: `nodejs`, `npm` (yarn/pnpm via `npm`/`corepack`)
+- **Go**: installed to `/usr/local/go` (see `GO_VERSION` build arg)
+- **Rust**: `rustup` + `cargo` (toolchain in `/opt/rust`)
+- **Java**: `default-jdk` + **Maven** (`mvn`) + **Gradle** (`/opt/gradle`)
+- **.NET**: `dotnet` SDK in `/usr/local/dotnet` (see `DOTNET_CHANNEL` build arg)
+- **C/C++**: `build-essential`, `pkg-config`, `libssl-dev`
+
+**Tooling**
+- `git`, `gh` (GitHub CLI), `openssh-client`
+- `curl`, `wget`, `ca-certificates`
 - Data manipulation: `jq`, `ripgrep`, `grep`, `sed`, `gawk`, `findutils`, `coreutils`, `diffutils`, `patch`
 - Archives: `tar`, `gzip`, `bzip2`, `xz-utils`, `zip`, `unzip`
 - `less`
+
+### Toolchain caches on a read-only root filesystem
+
+The sandbox runs with a **read-only root FS** and **capped ephemeral storage**, so every
+toolchain cache/home is redirected to the writable `/tmp` tmpfs via image `ENV` (and
+pre-created by `entrypoint.sh`):
+
+| Tool | Env var | Path |
+|---|---|---|
+| Go | `GOPATH` / `GOCACHE` / `GOMODCACHE` | `/tmp/go*` |
+| Rust | `CARGO_HOME` (toolchain read-only in `/opt/rust`) | `/tmp/cargo` |
+| Gradle | `GRADLE_USER_HOME` | `/tmp/gradle` |
+| Maven | `HOME` → `~/.m2` | `/tmp/sandbox-home/.m2` |
+| .NET | `DOTNET_CLI_HOME` / `NUGET_PACKAGES` | `/tmp/dotnet-home`, `/tmp/nuget` |
+| pip | `PIP_CACHE_DIR` | `/tmp/pip-cache` |
+| npm | `npm_config_cache` | `/tmp/npm-cache` |
+
+> Heavy .NET / JVM restores can approach the default 2Gi ephemeral-storage limit. For
+> large dependency trees, build under `/workspace` (the PVC) or raise
+> `SANDBOX_EPHEMERAL_STORAGE_LIMIT` on the orchestrator.
+
+### Package-registry network access
+
+All egress is forced through the MITM proxy, which is **closed by default**. The proxy
+allowlist (`proxy/addons/inject.py` → `PUBLIC_EGRESS_HOSTS`) permits the standard PUBLIC
+registries so `pip`, `npm`, `go`, `cargo`, `mvn`/`gradle`, and `dotnet`/`nuget` can fetch
+dependencies **without** any credential injection: PyPI, npm, proxy.golang.org/sum.golang.org,
+crates.io, Maven Central, Gradle distributions, and NuGet. Broad object stores (GCS/S3/Azure
+Blob) are intentionally *not* allowed (exfiltration risk). Private registries: add them to
+`HOST_RULES` with a token instead.
 
 > `gh` and `git` route their HTTPS traffic through the MITM proxy, which injects
 > credentials. For `gh` API calls to work, the proxy addon's host rules must

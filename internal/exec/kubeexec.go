@@ -158,7 +158,15 @@ func (e *KubeExecutor) StartJob(ctx context.Context, cmd Command) (*Job, error) 
 	}
 	id := uuid.NewString()
 	logFile := "/tmp/job-" + id + ".log"
-	launcher := "nohup /bin/sh -lc " + shellQuote(line) + " > " + shellQuote(logFile) + " 2>&1 & echo $!"
+	rcFile := "/tmp/job-" + id + ".rc"
+	// Run the command, capture its output to logFile, then write the exit code
+	// to rcFile as a completion sentinel. We cannot rely on `kill -0 <pid>`
+	// alone: the sandbox PID 1 is `sleep infinity`, which never reaps children,
+	// so a finished background job lingers as a zombie whose PID still answers
+	// `kill -0`, making the job look like it runs forever. The rc-file gives an
+	// unambiguous "done" signal and the real exit code.
+	inner := "( " + line + " ) > " + shellQuote(logFile) + " 2>&1; echo $? > " + shellQuote(rcFile)
+	launcher := "nohup /bin/sh -lc " + shellQuote(inner) + " >/dev/null 2>&1 & echo $!"
 
 	res, err := e.Run(ctx, Command{PodName: cmd.PodName, Line: launcher, Timeout: cmd.Timeout})
 	if err != nil {
@@ -172,7 +180,7 @@ func (e *KubeExecutor) StartJob(ctx context.Context, cmd Command) (*Job, error) 
 		return nil, err
 	}
 
-	job := &Job{ID: id, PodName: cmd.PodName, PID: pid, LogFile: logFile, Running: true, StartedAt: time.Now()}
+	job := &Job{ID: id, PodName: cmd.PodName, PID: pid, LogFile: logFile, RCFile: rcFile, Running: true, StartedAt: time.Now()}
 	e.mu.Lock()
 	e.reapJobsLocked()
 	e.jobs[id] = cloneJob(job)
@@ -202,14 +210,29 @@ func (e *KubeExecutor) PollJob(ctx context.Context, podName, jobID string) (*Job
 		return nil, "", err
 	}
 
-	alive, err := e.processAlive(ctx, job.PodName, job.PID)
+	// The exit-code sentinel is authoritative: if it exists, the command ran to
+	// completion (regardless of any lingering zombie PID) and its content is the
+	// real exit code.
+	rc, rcDone, err := e.readExitCode(ctx, job.PodName, job.RCFile)
 	if err != nil {
 		return nil, "", err
 	}
-	job.Running = alive
-	if !alive {
-		job.ExitCode = 0
+	if rcDone {
+		job.Running = false
+		job.ExitCode = rc
 		if job.FinishedAt.IsZero() {
+			job.FinishedAt = time.Now()
+		}
+	} else {
+		// No sentinel yet. Fall back to a zombie-aware liveness check so a job
+		// that was killed (and thus never wrote a sentinel) is still reported as
+		// finished rather than hanging forever.
+		alive, aerr := e.processAlive(ctx, job.PodName, job.PID)
+		if aerr != nil {
+			return nil, "", aerr
+		}
+		job.Running = alive
+		if !alive && job.FinishedAt.IsZero() {
 			job.FinishedAt = time.Now()
 		}
 	}
@@ -405,11 +428,41 @@ func (e *KubeExecutor) lookupJob(podName, jobID string) (*Job, error) {
 }
 
 func (e *KubeExecutor) processAlive(ctx context.Context, podName string, pid int) (bool, error) {
-	res, err := e.Run(ctx, Command{PodName: podName, Line: "kill -0 " + strconv.Itoa(pid) + " 2>/dev/null", Timeout: 5 * time.Second})
+	// A finished background job whose parent has exited is reparented to PID 1
+	// (`sleep infinity`), which never reaps it, so it lingers as a zombie. A
+	// zombie's PID still answers `kill -0`, so we must explicitly treat the
+	// zombie ("Z") process state as not-alive by inspecting /proc/<pid>/status.
+	script := fmt.Sprintf(
+		`if [ ! -e /proc/%d/status ]; then exit 1; fi; if grep -qE '^State:[[:space:]]*Z' /proc/%d/status; then exit 1; fi; exit 0`,
+		pid, pid,
+	)
+	res, err := e.Run(ctx, Command{PodName: podName, Line: script, Timeout: 5 * time.Second})
 	if err != nil {
 		return false, err
 	}
 	return res.ExitCode == 0, nil
+}
+
+// readExitCode reads the job's exit-code sentinel. It returns (code, true, nil)
+// once the sentinel exists with a parseable integer, or (0, false, nil) while
+// the job is still running (sentinel absent/empty).
+func (e *KubeExecutor) readExitCode(ctx context.Context, podName, rcFile string) (int, bool, error) {
+	if rcFile == "" {
+		return 0, false, nil
+	}
+	res, err := e.Run(ctx, Command{PodName: podName, Line: "cat " + shellQuote(rcFile) + " 2>/dev/null || true", Timeout: 5 * time.Second})
+	if err != nil {
+		return 0, false, err
+	}
+	s := strings.TrimSpace(res.Stdout)
+	if s == "" {
+		return 0, false, nil
+	}
+	code, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, false, nil
+	}
+	return code, true, nil
 }
 
 func (e *KubeExecutor) readJobLog(ctx context.Context, podName, logFile string) (string, error) {
