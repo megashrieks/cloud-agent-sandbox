@@ -1,0 +1,59 @@
+# Defense-in-depth for the MITM proxy pool. The proxy addon (proxy/addons/inject.py)
+# already refuses to forward to internal targets, but that guard is application
+# level. This policy enforces the same boundary at the network layer so the proxy
+# pod PHYSICALLY cannot reach cloud metadata, the Kubernetes API, the orchestrator,
+# or any other in-cluster / private host, even if the addon is misconfigured or
+# bypassed. A malicious sandbox therefore cannot use the proxy as a confused deputy
+# for SSRF into internal infrastructure.
+#
+# The proxy is allowed to reach ONLY: DNS (to resolve upstreams) and the public
+# internet. It has no legitimate reason to talk to any private address.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mitmproxy-egress-public-only
+  namespace: sandboxes
+spec:
+  podSelector:
+    matchLabels:
+      app: mitmproxy
+  policyTypes:
+    - Egress
+    - Ingress
+  # Ingress: only sandboxes may connect to the proxy port.
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: sandbox
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS resolution (kube-dns / CoreDNS). kube-dns lives on a cluster IP inside
+    # the blocked ranges below, so it needs its own explicit allow rule.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Public internet only. Everything except loopback, link-local (incl. the
+    # 169.254.169.254 cloud metadata endpoint), RFC1918, and the CGNAT range is
+    # allowed. Cluster service/pod CIDRs in kind and most clusters fall inside
+    # 10.0.0.0/8, so excepting the private ranges also blocks the k8s API and the
+    # orchestrator's control-plane API.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+              - 100.64.0.0/10
