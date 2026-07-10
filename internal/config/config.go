@@ -147,6 +147,11 @@ type ProxyConfig struct {
 
 // SecurityConfig controls fail-closed safety checks at startup.
 type SecurityConfig struct {
+	// APIKey is the shared secret every caller must present on the REST and MCP
+	// surfaces as "Authorization: Bearer <key>". It is REQUIRED: the orchestrator
+	// refuses to start when it is empty, so the control plane is never exposed
+	// unauthenticated. Set via SANDBOX_API_KEY.
+	APIKey string
 	// RequireNetworkPolicy makes the orchestrator refuse to start unless it can
 	// confirm the cluster will enforce the sandbox egress NetworkPolicy. This
 	// converts a silent fail-OPEN (policy present but unenforced) into a loud
@@ -287,6 +292,7 @@ func Load() (Config, error) {
 	if c.Security.RequireNetworkPolicy, err = envBool("SANDBOX_REQUIRE_NETWORK_POLICY", c.Security.RequireNetworkPolicy); err != nil {
 		return c, err
 	}
+	c.Security.APIKey = env("SANDBOX_API_KEY", c.Security.APIKey)
 	if c.Security.NetworkPolicyEnforced, err = envBoolPtr("SANDBOX_NETWORK_POLICY_ENFORCED"); err != nil {
 		return c, err
 	}

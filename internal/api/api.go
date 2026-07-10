@@ -42,6 +42,9 @@ type createSessionRequest struct {
 
 type sessionDTO struct {
 	ID             string        `json:"id"`
+	Ref            string        `json:"ref,omitempty"`
+	OrgID          string        `json:"orgId,omitempty"`
+	UserID         string        `json:"userId,omitempty"`
 	State          session.State `json:"state"`
 	Image          string        `json:"image"`
 	RuntimeClass   string        `json:"runtimeClass"`
@@ -254,6 +257,9 @@ func toSessionDTO(s *session.Session) sessionDTO {
 	}
 	return sessionDTO{
 		ID:             s.ID,
+		Ref:            s.Ref,
+		OrgID:          s.OrgID,
+		UserID:         s.UserID,
 		State:          s.State,
 		Image:          s.Image,
 		RuntimeClass:   s.RuntimeClass,

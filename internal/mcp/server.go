@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	mcplib "github.com/mark3labs/mcp-go/mcp"
@@ -16,11 +17,37 @@ import (
 	"github.com/megashrieks/cloud-agent-sandbox/internal/session"
 )
 
+// HTTP headers that carry caller identity into every MCP request. X-Session-Id
+// is mandatory and selects (get-or-create) the sandbox; the other two are
+// optional attribution metadata.
+const (
+	headerSessionID = "X-Session-Id"
+	headerOrgID     = "X-Org-Id"
+	headerUserID    = "X-User-Id"
+)
+
+type ctxKey int
+
+const identityKey ctxKey = iota
+
+// identity carries the caller headers extracted from the HTTP request into the
+// tool-handler context.
+type identity struct {
+	ref    string
+	orgID  string
+	userID string
+}
+
 // Server exposes sandbox operations as Model Context Protocol tools.
 type Server struct {
 	m   *manager.Manager
 	ex  exec.Executor
 	log *slog.Logger
+
+	// eagerOnce tracks canonical session ids for which an eager-load has already
+	// been kicked off, so repeated requests on the same connection do not spawn
+	// redundant provisioning goroutines.
+	eagerOnce sync.Map
 }
 
 // New constructs an MCP server facade for sandbox sessions.
@@ -35,21 +62,62 @@ func New(m *manager.Manager, ex exec.Executor, log *slog.Logger) *Server {
 func (s *Server) Handler() http.Handler {
 	mcpSrv := mcpserver.NewMCPServer("sandbox-orchestrator", "0.1.0")
 	s.registerTools(mcpSrv)
-	return mcpserver.NewStreamableHTTPServer(mcpSrv, mcpserver.WithStreamableHTTPLogger(s.log))
+	return mcpserver.NewStreamableHTTPServer(mcpSrv,
+		mcpserver.WithStreamableHTTPLogger(s.log),
+		mcpserver.WithHTTPContextFunc(s.withIdentity),
+	)
+}
+
+// withIdentity lifts the caller identity headers off each HTTP request into the
+// request context and, when a session reference is present, eagerly begins
+// provisioning its sandbox so it is ready by the time the first tool runs. The
+// eager load is best-effort and fire-and-forget: tool calls still block on
+// EnsureSession, which shares the same per-id lock.
+func (s *Server) withIdentity(ctx context.Context, r *http.Request) context.Context {
+	id := identity{
+		ref:    strings.TrimSpace(r.Header.Get(headerSessionID)),
+		orgID:  strings.TrimSpace(r.Header.Get(headerOrgID)),
+		userID: strings.TrimSpace(r.Header.Get(headerUserID)),
+	}
+	ctx = context.WithValue(ctx, identityKey, id)
+	if id.ref == "" {
+		return ctx
+	}
+	canonical := session.CanonicalID(id.ref)
+	if _, loaded := s.eagerOnce.LoadOrStore(canonical, struct{}{}); loaded {
+		return ctx
+	}
+	go func() {
+		bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		if _, err := s.m.EnsureSession(bg, session.CreateOptions{
+			Ref:    id.ref,
+			OrgID:  id.orgID,
+			UserID: id.userID,
+		}, false); err != nil {
+			// Not fatal: the first tool call will retry and surface the error.
+			s.eagerOnce.Delete(canonical)
+			s.log.Warn("eager sandbox load failed", "session_ref", id.ref, "error", err)
+		}
+	}()
+	return ctx
 }
 
 func (s *Server) registerTools(srv *mcpserver.MCPServer) {
-	srv.AddTool(mcplib.NewTool("create_session",
-		mcplib.WithDescription("Create one new sandbox session. Use first; other tools require the returned session_id."),
+	srv.AddTool(mcplib.NewTool("create_sandbox",
+		mcplib.WithDescription("Provision (or re-provision) the sandbox for this session. The session is identified by the X-Session-Id request header, so no id argument is needed; a sandbox is also auto-created on first use, so calling this is only necessary to pick a specific image or posture. If a sandbox already exists for the session with a different image, it is purged and recreated with the requested image."),
 		mcplib.WithString("image", mcplib.Description("Optional container image. Omit or use \"default\" for the standard polyglot sandbox image. Otherwise pass any fully-qualified image reference the cluster can pull (e.g. alpine:3.20, python:3.12, node:22, ubuntu:24.04). By default the sandbox runs as root with a writable root filesystem so you can install packages inside it (apk add / apt-get install / pip install), and all outbound network works via the credential-injecting proxy.")),
 		mcplib.WithBoolean("use_kata", mcplib.Description("Request stronger Kata isolation when available.")),
 		mcplib.WithBoolean("writable_root", mcplib.Description("Optional. Default true. Whether the container root filesystem is writable so system package managers can install. Set false to harden (read-only root; /workspace and /tmp stay writable).")),
 		mcplib.WithBoolean("run_as_root", mcplib.Description("Optional. Default true. Whether the sandbox process runs as root (UID 0) so it can install system packages. Set false to run as an unprivileged user.")),
-	), s.createSession)
+	), s.createSandbox)
+
+	srv.AddTool(mcplib.NewTool("clear_session",
+		mcplib.WithDescription("Delete the sandbox for this session (identified by the X-Session-Id header), destroying its container and workspace. A later request with the same session id starts a fresh sandbox."),
+	), s.clearSession)
 
 	srv.AddTool(mcplib.NewTool("shell",
-		mcplib.WithDescription("Run a shell command synchronously in a sandbox and return exit code, stdout, and stderr."),
-		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
+		mcplib.WithDescription("Run a shell command synchronously in this session's sandbox and return exit code, stdout, and stderr."),
 		mcplib.WithString("command", mcplib.Required(), mcplib.Description("Shell command line to execute.")),
 		mcplib.WithString("cwd", mcplib.Description("Optional working directory.")),
 		mcplib.WithNumber("timeout_seconds", mcplib.Description("Optional execution timeout in seconds.")),
@@ -57,34 +125,29 @@ func (s *Server) registerTools(srv *mcpserver.MCPServer) {
 
 	srv.AddTool(mcplib.NewTool("shell_async",
 		mcplib.WithDescription("Start a long-running shell command and return a job_id for polling or stopping."),
-		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
 		mcplib.WithString("command", mcplib.Required(), mcplib.Description("Shell command line to start.")),
 		mcplib.WithString("cwd", mcplib.Description("Optional working directory.")),
 	), s.shellAsync)
 
 	srv.AddTool(mcplib.NewTool("shell_poll",
 		mcplib.WithDescription("Poll an async shell job and return running/exit status plus accumulated output."),
-		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
 		mcplib.WithString("job_id", mcplib.Required(), mcplib.Description("Job id returned by shell_async.")),
 	), s.shellPoll)
 
 	srv.AddTool(mcplib.NewTool("shell_stop",
 		mcplib.WithDescription("Stop an async shell job; omit job_id to interrupt/reset the current shell."),
-		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
 		mcplib.WithString("job_id", mcplib.Description("Optional job id to stop.")),
 	), s.shellStop)
 
 	srv.AddTool(mcplib.NewTool("shell_wait",
 		mcplib.WithDescription("Block until an async shell job finishes (or the timeout elapses) and return its final status plus full accumulated output. Use after shell_async when you just want the result and don't need to poll manually."),
-		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
 		mcplib.WithString("job_id", mcplib.Required(), mcplib.Description("Job id returned by shell_async.")),
 		mcplib.WithNumber("timeout_seconds", mcplib.Description("Optional max seconds to wait. If the job is still running when this elapses, returns the current (running) status and output so far. Omit or <=0 to wait indefinitely (up to the request deadline).")),
 		mcplib.WithNumber("poll_interval_seconds", mcplib.Description("Optional seconds between internal status checks. Default 1.")),
 	), s.shellWait)
 
 	srv.AddTool(mcplib.NewTool("str_replace_based_edit_tool",
-		mcplib.WithDescription("File editor for a sandbox. Choose the operation with the `command` field: `view` prints a file with 1-indexed line numbers, optionally sliced by `view_range`; `create` writes (or overwrites) a file with `file_text`; `str_replace` replaces a unique `old_str` with `new_str`; `insert` adds `new_str` after line `insert_line` (0 = start of file)."),
-		mcplib.WithString("session_id", mcplib.Required(), mcplib.Description("Sandbox session id from create_session.")),
+		mcplib.WithDescription("File editor for this session's sandbox. Choose the operation with the `command` field: `view` prints a file with 1-indexed line numbers, optionally sliced by `view_range`; `create` writes (or overwrites) a file with `file_text`; `str_replace` replaces a unique `old_str` with `new_str`; `insert` adds `new_str` after line `insert_line` (0 = start of file)."),
 		mcplib.WithString("command", mcplib.Required(), mcplib.Enum("view", "create", "str_replace", "insert"), mcplib.Description("The edit operation to perform: view | create | str_replace | insert.")),
 		mcplib.WithString("path", mcplib.Required(), mcplib.Description("Absolute file path inside the sandbox (e.g. /workspace/app/main.py).")),
 		mcplib.WithArray("view_range", mcplib.Description("Optional for `view`: [start_line, end_line], both 1-indexed. Use -1 as end_line to read to end of file."), mcplib.Items(map[string]any{"type": "integer"})),
@@ -175,11 +238,19 @@ func (s *Server) editTool(ctx context.Context, req mcplib.CallToolRequest) (*mcp
 	}
 }
 
-func (s *Server) createSession(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
-	image := req.GetString("image", "")
-	useKata := req.GetBool("use_kata", false)
+func (s *Server) createSandbox(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	id, ok := identityFromCtx(ctx)
+	if !ok {
+		return mcplib.NewToolResultError(missingSessionMsg), nil
+	}
 
-	opts := session.CreateOptions{Image: image, UseKata: useKata}
+	opts := session.CreateOptions{
+		Ref:     id.ref,
+		OrgID:   id.orgID,
+		UserID:  id.userID,
+		Image:   req.GetString("image", ""),
+		UseKata: req.GetBool("use_kata", false),
+	}
 	args := req.GetArguments()
 	if v, ok := args["writable_root"]; ok {
 		if b, ok := v.(bool); ok {
@@ -192,11 +263,26 @@ func (s *Server) createSession(ctx context.Context, req mcplib.CallToolRequest) 
 		}
 	}
 
-	sess, err := s.m.Create(ctx, opts)
+	sess, err := s.m.EnsureSession(ctx, opts, true)
 	if err != nil {
-		return mcplib.NewToolResultError(fmt.Sprintf("create session: %v", err)), nil
+		return mcplib.NewToolResultError(fmt.Sprintf("create sandbox: %v", err)), nil
 	}
-	return mcplib.NewToolResultText(fmt.Sprintf("session_id: %s\nimage: %s", sess.ID, sess.Image)), nil
+	return mcplib.NewToolResultText(fmt.Sprintf("ready\nimage: %s", sess.Image)), nil
+}
+
+func (s *Server) clearSession(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
+	id, ok := identityFromCtx(ctx)
+	if !ok {
+		return mcplib.NewToolResultError(missingSessionMsg), nil
+	}
+	s.eagerOnce.Delete(session.CanonicalID(id.ref))
+	if err := s.m.Clear(ctx, id.ref); err != nil {
+		if errors.Is(err, session.ErrInvalidSession) {
+			return mcplib.NewToolResultText("no sandbox to clear"), nil
+		}
+		return mcplib.NewToolResultError(fmt.Sprintf("clear session: %v", err)), nil
+	}
+	return mcplib.NewToolResultText("cleared"), nil
 }
 
 func (s *Server) shell(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
@@ -325,26 +411,45 @@ func (s *Server) shellStop(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	return mcplib.NewToolResultText(fmt.Sprintf("stopped job_id: %s", jobID)), nil
 }
 
-// requireSession validates the session id, marks an in-flight MCP call
-// (BeginActivity), and returns a cleanup func that MUST be deferred by the
-// caller to mark the call complete (EndActivity). On failure the returned
+// requireSession resolves the caller's sandbox from the X-Session-Id header
+// (carried in ctx), get-or-creating it via EnsureSession, marks an in-flight
+// MCP call (BeginActivity), and returns a cleanup func that MUST be deferred by
+// the caller to mark the call complete (EndActivity). On failure the returned
 // cleanup is a safe no-op.
-func (s *Server) requireSession(ctx context.Context, req mcplib.CallToolRequest) (*session.Session, func(), *mcplib.CallToolResult) {
+func (s *Server) requireSession(ctx context.Context, _ mcplib.CallToolRequest) (*session.Session, func(), *mcplib.CallToolResult) {
 	noop := func() {}
-	sessionID, err := req.RequireString("session_id")
-	if err != nil {
-		return nil, noop, mcplib.NewToolResultError(err.Error())
+	id, ok := identityFromCtx(ctx)
+	if !ok {
+		return nil, noop, mcplib.NewToolResultError(missingSessionMsg)
 	}
-	sess, err := s.m.Require(ctx, sessionID)
+	sess, err := s.m.EnsureSession(ctx, session.CreateOptions{
+		Ref:    id.ref,
+		OrgID:  id.orgID,
+		UserID: id.userID,
+	}, false)
 	if err != nil {
 		if errors.Is(err, session.ErrInvalidSession) {
 			return nil, noop, mcplib.NewToolResultError("invalid session")
 		}
-		return nil, noop, mcplib.NewToolResultError(fmt.Sprintf("require session: %v", err))
+		return nil, noop, mcplib.NewToolResultError(fmt.Sprintf("ensure session: %v", err))
 	}
-	s.m.BeginActivity(ctx, sessionID)
-	cleanup := func() { s.m.EndActivity(context.WithoutCancel(ctx), sessionID) }
+	s.m.BeginActivity(ctx, sess.ID)
+	cleanup := func() { s.m.EndActivity(context.WithoutCancel(ctx), sess.ID) }
 	return sess, cleanup, nil
+}
+
+// missingSessionMsg is returned when a tool is called without the mandatory
+// session header.
+const missingSessionMsg = "missing X-Session-Id header: every request must carry a session id"
+
+// identityFromCtx returns the caller identity extracted by withIdentity. ok is
+// false when no (non-empty) X-Session-Id header was present.
+func identityFromCtx(ctx context.Context) (identity, bool) {
+	id, ok := ctx.Value(identityKey).(identity)
+	if !ok || id.ref == "" {
+		return identity{}, false
+	}
+	return id, true
 }
 
 func timeoutFromRequest(req mcplib.CallToolRequest) time.Duration {

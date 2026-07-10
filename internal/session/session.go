@@ -32,8 +32,17 @@ var ErrInvalidSession = errors.New("invalid session")
 
 // Session is the persisted record for a sandbox.
 type Session struct {
-	// ID is the opaque, LLM-facing session identifier.
+	// ID is the canonical, Kubernetes-safe session identifier (derived from Ref
+	// via CanonicalID). It is the store key and the basis for pod/PVC names.
 	ID string
+	// Ref is the raw, caller-supplied session reference (the X-Session-Id
+	// header) that ID was derived from. Kept for display and correlation.
+	Ref string
+	// OrgID / UserID are optional caller-supplied identity metadata (the
+	// X-Org-Id / X-User-Id headers). Recorded for attribution only; they are not
+	// used for access-control decisions.
+	OrgID  string
+	UserID string
 	// State is the current lifecycle state.
 	State State
 	// Image is the container image backing this sandbox.
@@ -59,6 +68,11 @@ func (s *Session) Running() bool { return s.State == StateRunning }
 
 // CreateOptions are the inputs for creating a new session.
 type CreateOptions struct {
+	// Ref / OrgID / UserID are the caller-supplied identity headers. Ref is the
+	// raw X-Session-Id; OrgID / UserID are optional attribution metadata.
+	Ref    string
+	OrgID  string
+	UserID string
 	// Image overrides the default sandbox image when non-empty.
 	Image string
 	// ProxyGroup optionally pins the session to a specific proxy group.

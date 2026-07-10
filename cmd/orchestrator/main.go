@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,6 +41,15 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+
+	// Fail closed: the control plane (REST + MCP) must never be exposed without
+	// authentication. A malicious sandbox that finds the orchestrator address
+	// (or any other reachable client) could otherwise list, create, or destroy
+	// arbitrary tenants' sandboxes.
+	if cfg.Security.APIKey == "" {
+		return fmt.Errorf("SANDBOX_API_KEY is required (refusing to start an unauthenticated orchestrator)")
+	}
+
 	logger.Info("starting sandbox orchestrator",
 		"listen", cfg.ListenAddr,
 		"namespace", cfg.Kube.Namespace,
@@ -125,10 +135,11 @@ func run(logger *slog.Logger) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.Handle("/sessions", apiHandler)
-	mux.Handle("/sessions/", apiHandler)
-	mux.Handle("/mcp", mcpHandler)
-	mux.Handle("/mcp/", mcpHandler)
+	authed := requireAPIKey(cfg.Security.APIKey, logger)
+	mux.Handle("/sessions", authed(apiHandler))
+	mux.Handle("/sessions/", authed(apiHandler))
+	mux.Handle("/mcp", authed(mcpHandler))
+	mux.Handle("/mcp/", authed(mcpHandler))
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -149,4 +160,26 @@ func run(logger *slog.Logger) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
+}
+
+// requireAPIKey wraps a handler so every request must present the shared secret
+// as "Authorization: Bearer <key>". The comparison is constant-time to avoid
+// leaking the key through timing. /healthz is registered separately and stays
+// open for liveness probes.
+func requireAPIKey(key string, logger *slog.Logger) func(http.Handler) http.Handler {
+	want := []byte("Bearer " + key)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got := r.Header.Get("Authorization")
+			if subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+				logger.Warn("rejected unauthenticated request", "path", r.URL.Path, "remote", r.RemoteAddr)
+				w.Header().Set("WWW-Authenticate", "Bearer")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }

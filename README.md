@@ -5,10 +5,11 @@ to run **untrusted, agent-authored code** (clone a repo, install tooling, run bu
 edit files, and open pull requests) **without ever exposing real git credentials to the code it
 runs**.
 
-The agent drives sandboxes over **MCP** (streamable HTTP). It creates a sandbox (or resumes an
-existing one by session id), then works inside it entirely through exposed tools. Anything the code
-does over the network that needs authentication (e.g. `git push`, `gh`, API calls to GitHub/GitLab)
-is transparently authenticated by a **MITM proxy sidecar** that injects credentials in flight. The
+The agent drives sandboxes over **MCP** (streamable HTTP). Every request carries an `X-Session-Id`
+header that names the sandbox; the orchestrator get-or-creates it on first use and reuses it on
+later calls, so the agent just keeps talking to the same session id. Anything the code does over the
+network that needs authentication (e.g. `git push`, `gh`, API calls to GitHub/GitLab) is
+transparently authenticated by a **MITM proxy sidecar** that injects credentials in flight. The
 sandbox trusts the proxy's CA but **never sees the token**, and the orchestrator itself holds no
 credentials. It does pure orchestration.
 
@@ -57,15 +58,23 @@ Agent ──────────────────────▶ Orch
   **24h**; a self-healing sweep reconciles against Kubernetes so restarts never leak orphans.
 - **Scaling:** configurable warm pool (min idle ready), max running, max stopped; the proxy fleet
   autoscales (~1 proxy per 100 sandboxes, scale-to-zero when idle).
-- **Agent-optimized tools:** `create_session`, sync/async `shell` (persistent, stateful) with
-  `shell_poll` / `shell_wait` / `shell_stop`, and a single `str_replace_based_edit_tool`
-  (view / create / str_replace / insert).
+- **Agent-optimized tools:** header-driven sessions (`X-Session-Id`), sync/async `shell`
+  (persistent, stateful) with `shell_poll` / `shell_wait` / `shell_stop`, a single
+  `str_replace_based_edit_tool` (view / create / str_replace / insert), plus `create_sandbox` and
+  `clear_session`.
+- **Authenticated control plane:** the REST and MCP surfaces require a shared key
+  (`Authorization: Bearer <SANDBOX_API_KEY>`); the orchestrator refuses to start without one.
 
 ## MCP tools
 
+Identity travels in request headers, not tool arguments: `X-Session-Id` (required) selects the
+sandbox, and optional `X-Org-Id` / `X-User-Id` are recorded for attribution. A sandbox is
+auto-created the first time a session id is seen.
+
 | Tool | Purpose |
 |------|---------|
-| `create_session` | Provision a sandbox (choose `image`, `use_kata`, `run_as_root`, `writable_root`) or resume by session id. |
+| `create_sandbox` | Provision or re-provision this session's sandbox with a specific `image`, `use_kata`, `run_as_root`, or `writable_root`. Optional: sandboxes are auto-created on first use. |
+| `clear_session` | Delete this session's sandbox and workspace; a later request with the same id starts fresh. |
 | `shell` | Run a command synchronously in the persistent sandbox shell. |
 | `shell_async` | Start a long-running command in the background; returns a job id. |
 | `shell_poll` | Fetch current status/output of an async job. |

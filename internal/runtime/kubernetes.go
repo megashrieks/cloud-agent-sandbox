@@ -55,6 +55,9 @@ func (r *KubeRuntime) Create(ctx context.Context, spec SandboxSpec) (*SandboxHan
 			},
 		},
 	}
+	if err := r.waitPVCGone(ctx, pvcName); err != nil {
+		return nil, err
+	}
 	if _, err := r.cs.CoreV1().PersistentVolumeClaims(r.namespace).Create(ctx, pvc, metav1.CreateOptions{}); err != nil {
 		return nil, fmt.Errorf("create pvc %q: %w", pvcName, err)
 	}
@@ -75,6 +78,39 @@ func (r *KubeRuntime) Create(ctx context.Context, spec SandboxSpec) (*SandboxHan
 		return nil, fmt.Errorf("create pod %q: %w", pod.Name, err)
 	}
 	return handleFromPod(created), nil
+}
+
+// waitPVCGone blocks until no PersistentVolumeClaim with the given name exists,
+// which can happen briefly after a purge because PVC deletion is asynchronous
+// (a terminating PVC still holds the name and would collide with a fresh
+// create, e.g. when create_sandbox recreates a session on an image change).
+func (r *KubeRuntime) waitPVCGone(ctx context.Context, pvcName string) error {
+	pvcs := r.cs.CoreV1().PersistentVolumeClaims(r.namespace)
+	existing, err := pvcs.Get(ctx, pvcName, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get pvc %q: %w", pvcName, err)
+	}
+	if existing.DeletionTimestamp == nil {
+		return nil
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("wait for pvc %q to be deleted: %w", pvcName, waitCtx.Err())
+		case <-ticker.C:
+			if _, err := pvcs.Get(waitCtx, pvcName, metav1.GetOptions{}); apierrors.IsNotFound(err) {
+				return nil
+			}
+		}
+	}
 }
 
 func (r *KubeRuntime) WaitReady(ctx context.Context, podName string, timeout time.Duration) error {

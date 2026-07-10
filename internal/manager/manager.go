@@ -77,6 +77,12 @@ type Manager struct {
 	// the reaper never treats a session with a running tool call as idle.
 	activeMu sync.Mutex
 	active   map[string]int
+
+	// keyedMu guards keyed, a per-session-id lock set that serialises
+	// get-or-create so concurrent requests carrying the same X-Session-Id
+	// (eager-load plus the first tool call) cannot create duplicate sandboxes.
+	keyedMu sync.Mutex
+	keyed   map[string]*sync.Mutex
 }
 
 // New builds a Manager. pool and proxy may be nil for degraded/dev modes
@@ -90,7 +96,22 @@ func New(cfg config.Config, store session.Store, rt runtime.Runtime, pool Pool, 
 		proxy:   proxy,
 		readyTO: 90 * time.Second,
 		active:  make(map[string]int),
+		keyed:   make(map[string]*sync.Mutex),
 	}
+}
+
+// lockSession returns an unlock func for the per-id keyed lock, creating the
+// lock on first use. Callers MUST defer the returned func.
+func (m *Manager) lockSession(id string) func() {
+	m.keyedMu.Lock()
+	mu, ok := m.keyed[id]
+	if !ok {
+		mu = &sync.Mutex{}
+		m.keyed[id] = mu
+	}
+	m.keyedMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 // Store exposes the underlying session store (read-only helpers for callers
@@ -225,7 +246,13 @@ func (m *Manager) Create(ctx context.Context, opts session.CreateOptions) (*sess
 		return nil, fmt.Errorf("max running sandboxes reached (%d)", m.cfg.Pool.MaxRunning)
 	}
 
+	// A caller-supplied X-Session-Id (opts.Ref) is canonicalised into a
+	// stable, Kubernetes-safe id so the same header always maps to the same
+	// sandbox. REST creates without a ref get a fresh random id.
 	id := session.NewID()
+	if opts.Ref != "" {
+		id = session.CanonicalID(opts.Ref)
+	}
 	runtimeClass := m.cfg.Sandbox.RuntimeClass
 	if opts.UseKata && m.cfg.Sandbox.KataRuntimeClass != "" {
 		runtimeClass = m.cfg.Sandbox.KataRuntimeClass
@@ -233,6 +260,9 @@ func (m *Manager) Create(ctx context.Context, opts session.CreateOptions) (*sess
 
 	sess := &session.Session{
 		ID:             id,
+		Ref:            opts.Ref,
+		OrgID:          opts.OrgID,
+		UserID:         opts.UserID,
 		State:          session.StateCreating,
 		Image:          image,
 		RuntimeClass:   runtimeClass,
@@ -351,6 +381,82 @@ func (m *Manager) Require(ctx context.Context, id string) (*session.Session, err
 		return nil, session.ErrInvalidSession
 	}
 	return s, nil
+}
+
+// EnsureSession is the get-or-create entry point for the header-driven MCP
+// surface. It maps the caller-supplied reference (X-Session-Id) to a stable
+// canonical id and guarantees a running sandbox for it:
+//
+//   - no sandbox yet            => create one (eager load),
+//   - already running           => return it (optionally recreate on image
+//     change when recreateOnImageChange is set),
+//   - stopped                   => resume it,
+//   - stuck (creating/dead)     => purge and recreate.
+//
+// opts.Ref is mandatory. When recreateOnImageChange is true and the caller
+// requests an explicit image that differs from the running sandbox's, the old
+// sandbox is purged and replaced (create_sandbox semantics). Concurrent calls
+// for the same reference are serialised on a per-id lock so eager load and the
+// first tool call cannot race into two sandboxes.
+func (m *Manager) EnsureSession(ctx context.Context, opts session.CreateOptions, recreateOnImageChange bool) (*session.Session, error) {
+	if opts.Ref == "" {
+		return nil, session.ErrInvalidSession
+	}
+	id := session.CanonicalID(opts.Ref)
+
+	unlock := m.lockSession(id)
+	defer unlock()
+
+	existing, err := m.store.Get(ctx, id)
+	if err == nil && existing != nil {
+		desiredImage := m.resolveImage(opts.Image)
+		imageChange := recreateOnImageChange && opts.Image != "" && existing.Image != desiredImage
+
+		switch {
+		case imageChange:
+			// Fall through to recreate with the newly requested image.
+			m.purgeAndForget(context.WithoutCancel(ctx), existing)
+		case existing.Running():
+			return existing, nil
+		case existing.State == session.StateStopped:
+			return m.Resume(ctx, id)
+		default:
+			// Stuck in creating/dead: self-heal by purging and recreating.
+			m.purgeAndForget(context.WithoutCancel(ctx), existing)
+		}
+	}
+
+	return m.Create(ctx, opts)
+}
+
+// Clear purges the sandbox (pod + workspace) for a caller reference and forgets
+// it entirely, so a later request with the same X-Session-Id starts fresh.
+func (m *Manager) Clear(ctx context.Context, ref string) error {
+	if ref == "" {
+		return session.ErrInvalidSession
+	}
+	id := session.CanonicalID(ref)
+
+	unlock := m.lockSession(id)
+	defer unlock()
+
+	s, err := m.store.Get(ctx, id)
+	if err != nil || s == nil {
+		return session.ErrInvalidSession
+	}
+	m.purgeAndForget(ctx, s)
+	return nil
+}
+
+// purgeAndForget tears down the sandbox and removes its record from the store
+// so the canonical id is free to be recreated. Unlike Delete, it does not leave
+// a tombstone (which would block re-creation under the same id).
+func (m *Manager) purgeAndForget(ctx context.Context, s *session.Session) {
+	_ = m.rt.Purge(ctx, s.PodName, s.PVCName)
+	if m.proxy != nil {
+		m.proxy.Release(ctx, s.ID)
+	}
+	_ = m.store.Delete(ctx, s.ID)
 }
 
 // Touch records activity on a session (resets its idle timer).

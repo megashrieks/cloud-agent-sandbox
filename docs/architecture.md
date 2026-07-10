@@ -26,7 +26,8 @@ sandboxes and lets an LLM drive them over MCP, without ever exposing real git cr
 ## Request flow (create + use a sandbox)
 
 ```
-LLM ──(MCP: create_session)──► Manager.Create
+Auth ── every /sessions + /mcp request needs Authorization: Bearer $SANDBOX_API_KEY
+LLM ──(MCP: any tool, header X-Session-Id)──► Manager.EnsureSession (get-or-create)
         │                         ├─ enforce MaxRunning
         │                         ├─ ProxyAssigner.Assign  → endpoint + shared CA
         │                         ├─ Pool.Acquire (warm) OR Runtime.Create (cold)
@@ -34,18 +35,21 @@ LLM ──(MCP: create_session)──► Manager.Create
         │                         │        drop caps, HTTPS_PROXY + CA injected
         │                         ├─ WaitReady
         │                         └─ persist session (running)
-LLM ──(MCP: shell/read/write/…)─► validate session (Require) → Executor via pods/exec
+LLM ──(MCP: shell/edit/…)───────► EnsureSession (reuse) → Executor via pods/exec
 Sandbox ──egress──► mitmproxy (NetworkPolicy allows only this) → injects token → github/gitlab
 Reaper ──► Stop running >1h ; Purge stopped >24h
 ```
 
 ## Session lifecycle
 
-- **create_session** mints a session id (the only tool that does). Sandbox = Pod (+ workspace PVC).
+- **X-Session-Id** header names the sandbox. `Manager.EnsureSession` canonicalises it to a
+  Kubernetes-safe id and get-or-creates the sandbox (Pod + workspace PVC). First contact (including
+  the eager load on `tools/list`) provisions it; later calls reuse it.
+- **create_sandbox** re-provisions the session's sandbox with a chosen image/posture (purges and
+  recreates on image change).
+- **clear_session** purges the sandbox and forgets the id so it starts fresh next time.
 - **Stopped** = Pod deleted, PVC + metadata retained → resumable within 24h (`Manager.Resume`).
 - **Dead** = purged (Pod + PVC deleted).
-- Every non-create tool calls `Manager.Require`; unknown/expired/not-running sessions return
-  `invalid`.
 
 ## Credential model
 

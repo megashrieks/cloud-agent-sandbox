@@ -66,10 +66,17 @@ Customize injection/allowlist by editing `proxy/addons/inject.py` and rebuilding
 
 ## 4. Deploy
 
+The orchestrator refuses to start without an API key. Create it (any strong random string) alongside
+the new proxy egress policy:
+
 ```bash
 kubectl apply -f deploy/k8s/00-namespace.yaml
+kubectl -n sandboxes create secret generic orchestrator-auth \
+  --from-literal=api-key=$(openssl rand -hex 32)
+
 kubectl apply -f deploy/k8s/10-runtimeclasses.yaml     # skip if no gVisor/Kata
 kubectl apply -f deploy/k8s/20-networkpolicy-sandbox.yaml
+kubectl apply -f deploy/k8s/21-networkpolicy-mitmproxy.yaml
 kubectl apply -f deploy/k8s/30-orchestrator-rbac.yaml
 kubectl apply -f deploy/k8s/50-orchestrator.yaml       # provisions the shared CA on startup
 kubectl -n sandboxes rollout status deploy/orchestrator
@@ -83,24 +90,29 @@ kubectl -n sandboxes rollout status deploy/mitmproxy
 
 ## 5. Port-forward and smoke-test
 
+Every REST and MCP request needs the API key. Load it into a variable first:
+
 ```bash
 kubectl -n sandboxes port-forward svc/orchestrator 8080:8080 &
+KEY=$(kubectl -n sandboxes get secret orchestrator-auth -o jsonpath='{.data.api-key}' | base64 -d)
+AUTH="Authorization: Bearer $KEY"
 
-curl -s http://localhost:8080/healthz            # -> ok
-curl -s -XPOST http://localhost:8080/sessions | tee /tmp/s.json   # -> {"id":"sbx-...", ...}
-SID=$(jq -r .id /tmp/s.json)
-curl -s http://localhost:8080/sessions/$SID       # inspect
+curl -s http://localhost:8080/healthz            # -> ok (open, no auth)
+curl -s -H "$AUTH" http://localhost:8080/sessions        # -> [] (401 without the key)
 ```
 
 ## 6. End-to-end demo via MCP
 
-Point any MCP client at the streamable-HTTP endpoint `http://localhost:8080/mcp`, then:
+Point any MCP client at the streamable-HTTP endpoint `http://localhost:8080/mcp` and set two
+headers on every request: `Authorization: Bearer $KEY` and `X-Session-Id: <your-session-id>` (any
+stable string; the sandbox is created on first use and reused afterwards). Then:
 
-1. `create_session` → returns `session_id`.
-2. `shell` `{session_id, command: "git clone https://github.com/<org>/<repo> /workspace/repo"}`
-   The clone succeeds with credentials the sandbox never sees (injected by the proxy).
-3. `read_file` / `str_replace` / `write_file` to make changes.
-4. `shell` `{command: "cd /workspace/repo && git checkout -b change && git commit -am wip && git push -u origin change"}`.
+1. `shell` `{command: "git clone https://github.com/<org>/<repo> /workspace/repo"}`
+   The sandbox is auto-provisioned and the clone succeeds with credentials it never sees (injected
+   by the proxy). Call `create_sandbox` first only if you want a specific `image`.
+2. `str_replace_based_edit_tool` (`view` / `create` / `str_replace` / `insert`) to make changes.
+3. `shell` `{command: "cd /workspace/repo && git checkout -b change && git commit -am wip && git push -u origin change"}`.
+4. `clear_session` when done to destroy the sandbox and workspace.
 
 The sandbox trusts the injected CA, all egress is forced through the proxy, and the proxy injects
 the real token for github.com only. Everything else is blocked by the NetworkPolicy.

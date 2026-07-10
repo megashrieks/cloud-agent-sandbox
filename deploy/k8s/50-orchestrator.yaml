@@ -35,6 +35,16 @@ spec:
               value: "gvisor"
             - name: SANDBOX_DEFAULT_IMAGE
               value: "sandbox-default:latest"
+            # Shared secret every REST + MCP caller must present as
+            # "Authorization: Bearer <key>". The orchestrator refuses to start
+            # without it. Create the secret with:
+            #   kubectl -n sandboxes create secret generic orchestrator-auth \
+            #     --from-literal=api-key=$(openssl rand -hex 32)
+            - name: SANDBOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: orchestrator-auth
+                  key: api-key
           readinessProbe:
             httpGet:
               path: /healthz
